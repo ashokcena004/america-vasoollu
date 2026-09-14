@@ -23,7 +23,7 @@ from utils.generateFandangoImageReport import generate_fandango_image_report
 # ── 1. CONFIGURATION ─────────────────────────────────────────────────────────
 # =============================================================================
 
-SHOW_DATE = "2026-09-23"
+SHOW_DATE = "2026-09-24"
 URL = "https://www.fandango.com/the-paradise-2026-246366/movie-overview"
 
 # 🚨 FALLBACK & PRICING CONFIGURATION
