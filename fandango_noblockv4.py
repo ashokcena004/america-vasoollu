@@ -29,6 +29,7 @@ URL = "https://www.fandango.com/the-paradise-2026-246366/movie-overview"
 # 🚨 FALLBACK & PRICING CONFIGURATION
 AVG_PRICE = 27.00
 MAX_TIER_PRICE = 27.00 #XD D-Box Pricing
+DEFAULT_LANGUAGE = "Telugu"
 FALLBACK_SEATS = 100
 PRICE_TAX_CUT = False  # If True, rounds ticket prices down to nearest multiple of 5 (e.g., $29 -> $25)
 OCC_THRESHOLD_FRONTROW = 0.50  # If overall occupancy is below this, treat front row 'R' seats as blocks
@@ -169,7 +170,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
 
                     for amenity in variant.get('amenityGroups', []):
                         show_format = base_format
-                        show_language = "Unknown"
+                        show_language = DEFAULT_LANGUAGE
                         premium_keywords = ["XD", "IMAX", "3D", "DOLBY", "SCREENX", "4DX", "RPX", "PRIME", "BIGD", "XPLUS", "D-BOX", "70MM"]
                         language_keywords = ["TELUGU", "HINDI", "TAMIL", "MALAYALAM", "KANNADA"]
                         
@@ -187,7 +188,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                 # Prioritize the first matched language in our defined list.
                                 # Because "TELUGU" comes before "ENGLISH" in our list, 
                                 # "Telugu with English Subtitles" will safely match "TELUGU" and lock it in.
-                                if lang in am_upper and show_language == "Unknown":
+                                if lang in am_upper and show_language == DEFAULT_LANGUAGE:
                                     show_language = lang.capitalize()
                                     break
                         
@@ -332,7 +333,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                     
                             if all_cached:
                                 final_format = " / ".join(sorted(list(set(ft['format'] for ft in failed_tiers))))
-                                final_language = " / ".join(sorted(list(set(ft.get('language', 'Unknown') for ft in failed_tiers))))
+                                final_language = " / ".join(sorted(list(set(ft.get('language', DEFAULT_LANGUAGE) for ft in failed_tiers))))
                                 failed_urls = [f"https://www.fandango.com/napi/seatMap/{ft.get('hash', '')}" for ft in failed_tiers if ft.get('hash')]
                                 urls_str = " | ".join(failed_urls)
                                 price_str = " / ".join(sorted([f"${p:.2f}" for p in c_prices])) if c_prices else "$0.00"
@@ -358,8 +359,8 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                             # S10: Both APIs Fail + 'Available'
                             formats_seen = list(set(ft['format'] for ft in failed_tiers))
                             final_format = " / ".join(sorted(formats_seen)) if formats_seen else "Standard"
-                            languages_seen = list(set(ft.get('language', 'Unknown') for ft in failed_tiers))
-                            final_language = " / ".join(sorted(languages_seen)) if languages_seen else "Unknown"
+                            languages_seen = list(set(ft.get('language', DEFAULT_LANGUAGE) for ft in failed_tiers))
+                            final_language = " / ".join(sorted(languages_seen)) if languages_seen else DEFAULT_LANGUAGE
                             
                             failed_urls = [f"https://www.fandango.com/napi/seatMap/{ft.get('hash', '')}" for ft in failed_tiers if ft.get('hash')]
                             urls_str = " | ".join(failed_urls)
@@ -382,8 +383,8 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                             # S9: Both APIs Fail + 'SoldOut'
                             formats_seen = list(set(ft['format'] for ft in failed_tiers))
                             final_format = " / ".join(sorted(formats_seen))
-                            languages_seen = list(set(ft.get('language', 'Unknown') for ft in failed_tiers))
-                            final_language = " / ".join(sorted(languages_seen)) if languages_seen else "Unknown"
+                            languages_seen = list(set(ft.get('language', DEFAULT_LANGUAGE) for ft in failed_tiers))
+                            final_language = " / ".join(sorted(languages_seen)) if languages_seen else DEFAULT_LANGUAGE
                             
                             failed_urls = [f"https://www.fandango.com/napi/seatMap/{ft.get('hash', '')}" for ft in failed_tiers if ft.get('hash')]
                             urls_str = " | ".join(failed_urls)
@@ -454,7 +455,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                             
                         matrix_urls_str = " | ".join(matrix_urls)
                         final_format = " / ".join(sorted(formats_seen))
-                        final_language = " / ".join(sorted(languages_seen)) if languages_seen else "Unknown"
+                        final_language = " / ".join(sorted(languages_seen)) if languages_seen else DEFAULT_LANGUAGE
                         
                         uid_log = f"[{t_id} | {show_time} | {final_format}]"
                         
@@ -1025,7 +1026,7 @@ if __name__ == "__main__":
 
             master_shows_data.append({
                 'state': item['state'], 't_id': t_id, 'theater': item['theater'],
-                'format': fmt, 'language': item.get('language', 'Unknown'), 'time': item['time'], 'status': "Sold Out",
+                'format': fmt, 'language': item.get('language', DEFAULT_LANGUAGE), 'time': item['time'], 'status': "Sold Out",
                 'price_str': price_str, 'total': combined_total,
                 'booked': combined_booked, 'gross': combined_gross,
                 'seat_map_urls': item.get('seat_map_urls', '')
@@ -1073,7 +1074,7 @@ if __name__ == "__main__":
                 
                 # ✨ NEW: Extract Format and Language if provided, otherwise use defaults
                 fmt = str(ms[8]) if len(ms) > 8 and ms[8] else "Fan Event / Manual"
-                lang = str(ms[9]) if len(ms) > 9 and ms[9] else "Unknown"
+                lang = str(ms[9]) if len(ms) > 9 and ms[9] else DEFAULT_LANGUAGE
                 
                 t_name = "Unknown Theater"
                 if st in master_map:
