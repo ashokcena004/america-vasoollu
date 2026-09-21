@@ -44,7 +44,7 @@ MANUAL_SHOWS = [
     # ["Illinois", "AABCD", "7:00 PM", 1500.0, 3000.0, 75, 150, 0.50, "IMAX", "Telugu"]
     #["New Jersey", "AAEMI", "6:20 PM", 3125.0, 3125.0, 125, 125, 1.0, "Manual", "Telugu"],
     #["New Jersey", "AAEMI", "6:35 PM", 3125.0, 3125.0, 125, 125, 1.0, "Manual", "Telugu"],
-    ["EXTRA", "", "", 6000.0, 0, 250]
+    ["EXTRA", "", "", 4000.0, 0, 160]
 ]
 
 EXTRA_GROSS_NOTE = "Added extra gross for fans shows which are not added in fandano yet."
