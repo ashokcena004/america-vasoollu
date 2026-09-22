@@ -72,7 +72,7 @@ MANUAL_MERGE_SHOWS_THEATRES = ["AAILI"]
 
 # 🚫 IGNORE SOLD OUT SHOWS FOR SPECIFIC CHAINS
 # If a show at these chains is "Sold Out", its tickets and gross will be zeroed out.
-IGNORE_SOLDOUT_CHAINS = [] #Eg: AMC
+IGNORE_SOLDOUT_CHAINS = ["AMC"] #Eg: AMC
 
 # Extra Movie Details
 movie_part = URL.split("/")[-2]
