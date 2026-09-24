@@ -27,8 +27,8 @@ SHOW_DATE = "2026-09-23"
 URL = "https://www.fandango.com/the-paradise-2026-246366/movie-overview"
 
 # 🚨 FALLBACK & PRICING CONFIGURATION
-AVG_PRICE = 27.00
-MAX_TIER_PRICE = 27.00 #XD D-Box Pricing
+AVG_PRICE = 20.00
+MAX_TIER_PRICE = 20.00 #XD D-Box Pricing
 DEFAULT_LANGUAGE = "Telugu"
 FALLBACK_SEATS = 100
 PRICE_TAX_CUT = False  # If True, rounds ticket prices down to nearest multiple of 5 (e.g., $29 -> $25)
@@ -44,7 +44,7 @@ MANUAL_SHOWS = [
     # ["Illinois", "AABCD", "7:00 PM", 1500.0, 3000.0, 75, 150, 0.50, "IMAX", "Telugu"]
     #["New Jersey", "AAEMI", "6:20 PM", 3125.0, 3125.0, 125, 125, 1.0, "Manual", "Telugu"],
     #["New Jersey", "AAEMI", "6:35 PM", 3125.0, 3125.0, 125, 125, 1.0, "Manual", "Telugu"],
-    ["EXTRA", "", "", 4000.0, 0, 160]
+    # ["EXTRA", "", "", 4000.0, 0, 160]
 ]
 
 EXTRA_GROSS_NOTE = "Added extra gross for fans shows which are not added in fandano yet."
@@ -647,6 +647,10 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         all_tiers_info = [vt['tier_info'] for vt in cluster['tiers']] + cluster['failed_tiers']
                         is_any_available = any(t.get('status', '').lower() != 'soldout' for t in all_tiers_info)
                         has_failed_tiers = len(cluster['failed_tiers']) > 0
+                        has_available_failed_tiers = any(
+                            ft.get('status', '').lower() != 'soldout'
+                            for ft in cluster['failed_tiers']
+                        )
 
                         # --- 🎬 MATRIX LOGIC ---
                         base_aud_id = base_vt['data'].get('auditoriumId', 'Unknown')
@@ -716,7 +720,10 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                             for p in prices_seen: 
                                 if p > 0: local_knowledge_base[kb_key]['prices'].add(p)
 
-                        final_status = "Sold Out" if combined_booked >= combined_total and combined_total > 0 else "Available"
+                        if CUMULATIVE_TRACKING_MODE and has_available_failed_tiers:
+                            final_status = "Available (Map Error)"
+                        else:
+                            final_status = "Sold Out" if combined_booked >= combined_total and combined_total > 0 else "Available"
                         price_str = " / ".join(sorted([f"${p:.2f}" for p in prices_seen])) if prices_seen else "$0.00"
                         
                         print(f"   => 📊 Seats: {combined_total:<3} | Booked: {combined_booked:<3} | Gross: ${combined_gross:<7.2f} [{calc_method_log}]")
@@ -1194,17 +1201,6 @@ if __name__ == "__main__":
                     show['status'] = "Sold Out (Ignored)"
 
     # =========================================================================
-    # ── 4.8 SAVE REPORT ARTIFACTS (GitHub Actions Downloadable, Not Committed) ─
-    # =========================================================================
-    generated_reports = {}
-    if master_shows_data:
-        try:
-            generated_reports = generate_run_reports(master_shows_data, previous_shows_data, last_updated_str)
-        except Exception as e:
-            print(f"⚠️ Failed to generate run reports: {e}")
-            traceback.print_exc()
-
-    # =========================================================================
     # ── 4.8 CUMULATIVE TRACKING MODE (RESCUE PASSED SHOWS & PATCH ERRORS) ────
     # =========================================================================
     if CUMULATIVE_TRACKING_MODE and recent_shows_data:
@@ -1282,6 +1278,17 @@ if __name__ == "__main__":
                 # We strictly trust the live data, even if the gross goes down due to unblocked seats.
 
         print(f"   => ✅ Cumulative Tracking Complete: Rescued {rescued_shows_count} dropped shows. Patched {protected_shows_count} API errors.")
+
+    # =========================================================================
+    # ── 4.9 SAVE REPORT ARTIFACTS (GitHub Actions Downloadable, Not Committed) ─
+    # =========================================================================
+    generated_reports = {}
+    if master_shows_data:
+        try:
+            generated_reports = generate_run_reports(master_shows_data, previous_shows_data, last_updated_str)
+        except Exception as e:
+            print(f"⚠️ Failed to generate run reports: {e}")
+            traceback.print_exc()
 
 
     # =========================================================================
