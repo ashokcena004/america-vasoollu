@@ -1218,7 +1218,10 @@ if __name__ == "__main__":
         for i, row in enumerate(master_shows_data):
             # Unique key: TheaterID + Time + Format
             key = f"{row.get('t_id')}_{clean_str(row.get('time'))}_{clean_str(row.get('format'))}"
-            current_shows_dict[key] = {'index': i, 'data': row}
+            current_shows_dict.setdefault(key, []).append({
+                'index': i,
+                'data': row
+            })
             
         for prev_show in recent_shows_data:
             # Skip manual EXTRA overrides and Manual Shows (they are freshly processed in 4.5 anyway)
@@ -1228,8 +1231,9 @@ if __name__ == "__main__":
             prev_t_id = prev_show.get('t_id')
             prev_key = f"{prev_t_id}_{clean_str(prev_show.get('time'))}_{clean_str(prev_show.get('format'))}"
             
+            matching_current = current_shows_dict.get(prev_key, [])
             # --- SCENARIO A: The Show Disappeared (Passed Time or Fandango dropped it) ---
-            if prev_key not in current_shows_dict:
+            if not matching_current:
                 # Rescue the show
                 master_shows_data.append(prev_show)
                 
@@ -1251,8 +1255,9 @@ if __name__ == "__main__":
                 
             # --- SCENARIO B: The Show Exists, but LIVE data might be an API Crash ---
             else:
-                curr_idx = current_shows_dict[prev_key]['index']
-                curr_show = current_shows_dict[prev_key]['data']
+                current_entry = matching_current.pop(0)
+                curr_idx = current_entry['index']
+                curr_show = current_entry['data']
                 
                 # ✨ NEW LOGIC: Only overwrite if the live data explicitly crashed (Map Error)
                 is_api_crash = curr_show.get('status') == "Available (Map Error)"
