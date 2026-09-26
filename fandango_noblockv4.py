@@ -23,7 +23,7 @@ from utils.generateFandangoImageReport import generate_fandango_image_report
 # ── 1. CONFIGURATION ─────────────────────────────────────────────────────────
 # =============================================================================
 
-SHOW_DATE = "2026-09-25"
+SHOW_DATE = "2026-09-26"
 URL = "https://www.fandango.com/the-paradise-2026-246366/movie-overview"
 
 # 🚨 FALLBACK & PRICING CONFIGURATION
@@ -72,7 +72,7 @@ MANUAL_MERGE_SHOWS_THEATRES = ["AAILI"]
 
 # 🚫 IGNORE SOLD OUT SHOWS FOR SPECIFIC CHAINS
 # If a show at these chains is "Sold Out", its tickets and gross will be zeroed out.
-IGNORE_SOLDOUT_CHAINS = ["AMC"] #Eg: AMC
+IGNORE_SOLDOUT_CHAINS = [] #Eg: AMC
 
 # Extra Movie Details
 movie_part = URL.split("/")[-2]
