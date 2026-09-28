@@ -23,7 +23,7 @@ from utils.generateFandangoImageReport import generate_fandango_image_report
 # ── 1. CONFIGURATION ─────────────────────────────────────────────────────────
 # =============================================================================
 
-SHOW_DATE = "2026-09-27"
+SHOW_DATE = "2026-09-28"
 URL = "https://www.fandango.com/the-paradise-2026-246366/movie-overview"
 
 # 🚨 FALLBACK & PRICING CONFIGURATION
@@ -51,7 +51,7 @@ EXTRA_GROSS_NOTE = "Added extra gross for fans shows which are not added in fand
 
 MAPPING_FILE = "state_theatre_mapping.json"
 OVERWRITE_SNAPSHOT = os.getenv("OVERWRITE_SNAPSHOT", "false").lower() == "true" # ⚠️ Set to True to update the baseline after this run
-CUMULATIVE_TRACKING_MODE = True
+CUMULATIVE_TRACKING_MODE = False
 
 SEAT_COUNT_MODE = 1
 # 1 = Use physical seat map count when available (more accurate but slower)
