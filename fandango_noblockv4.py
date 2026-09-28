@@ -51,7 +51,7 @@ EXTRA_GROSS_NOTE = "Added extra gross for fans shows which are not added in fand
 
 MAPPING_FILE = "state_theatre_mapping.json"
 OVERWRITE_SNAPSHOT = os.getenv("OVERWRITE_SNAPSHOT", "false").lower() == "true" # ⚠️ Set to True to update the baseline after this run
-CUMULATIVE_TRACKING_MODE = False
+CUMULATIVE_TRACKING_MODE = True
 
 SEAT_COUNT_MODE = 1
 # 1 = Use physical seat map count when available (more accurate but slower)
