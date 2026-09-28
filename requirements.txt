@@ -4,3 +4,4 @@ python-dotenv
 Pillow
 firebase-admin
 pandas
+pytz

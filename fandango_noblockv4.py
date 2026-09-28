@@ -9,6 +9,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import sync_playwright
 import random
+import pytz
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -1205,10 +1206,41 @@ if __name__ == "__main__":
     # =========================================================================
     if CUMULATIVE_TRACKING_MODE and recent_shows_data:
         print(f"\n🛡️ Activating Cumulative Tracking Mode: Rescuing dropped shows and patching API errors...")
-        print("Activating CUMULATIVE_TRACKING_MODE...")
         
+        # Dictionary mapping exact JSON State keys to their primary timezone
+        STATE_TIMEZONES = {
+            'Alaska': 'America/Anchorage', 'Alabama': 'America/Chicago', 'Arkansas': 'America/Chicago',
+            'Arizona': 'America/Phoenix', 'California': 'America/Los_Angeles', 'Colorado': 'America/Denver',
+            'Connecticut': 'America/New_York', 'District Of Columbia': 'America/New_York', 'Delaware': 'America/New_York',
+            'Florida': 'America/New_York', 'Georgia': 'America/New_York', 'Hawaii': 'Pacific/Honolulu',
+            'Iowa': 'America/Chicago', 'Idaho': 'America/Denver', 'Illinois': 'America/Chicago',
+            'Indiana': 'America/Indiana/Indianapolis', 'Kansas': 'America/Chicago', 'Kentucky': 'America/New_York',
+            'Louisiana': 'America/Chicago', 'Massachusetts': 'America/New_York', 'Maryland': 'America/New_York',
+            'Maine': 'America/New_York', 'Michigan': 'America/Detroit', 'Minnesota': 'America/Chicago',
+            'Missouri': 'America/Chicago', 'Mississippi': 'America/Chicago', 'Montana': 'America/Denver',
+            'North Carolina': 'America/New_York', 'North Dakota': 'America/Chicago', 'Nebraska': 'America/Chicago',
+            'New Hampshire': 'America/New_York', 'New Jersey': 'America/New_York', 'New Mexico': 'America/Denver',
+            'Nevada': 'America/Los_Angeles', 'New York': 'America/New_York', 'Ohio': 'America/New_York',
+            'Oklahoma': 'America/Chicago', 'Oregon': 'America/Los_Angeles', 'Pennsylvania': 'America/New_York',
+            'RhodeIsland': 'America/New_York', 'South Carolina': 'America/New_York', 'South Dakota': 'America/Chicago',
+            'Tennessee': 'America/Chicago', 'Texas': 'America/Chicago', 'Utah': 'America/Denver',
+            'Virginia': 'America/New_York', 'Vermont': 'America/New_York', 'Washington': 'America/Los_Angeles',
+            'Wisconsin': 'America/Chicago', 'West Virginia': 'America/New_York', 'Wyoming': 'America/Denver',
+            'American Samoa': 'Pacific/Pago_Pago', 'Guam': 'Pacific/Guam'
+        }
+
+        # Parser that fixes Fandango's weird string times (e.g. "4 o'clock PM" -> "4:00 PM")
+        def parse_fandango_time(time_str):
+            if not time_str: return None
+            t_str = str(time_str).strip().lower().replace("o'clock", ":00").replace(" ", "")
+            try:
+                return datetime.strptime(t_str, "%I:%M%p").time()
+            except Exception:
+                return None
+
         rescued_shows_count = 0
         protected_shows_count = 0
+        dropped_shows_count = 0
         
         def clean_str(s):
             return str(s).replace(" ", "").replace("\u202f", "").lower()
@@ -1222,7 +1254,11 @@ if __name__ == "__main__":
                 'index': i,
                 'data': row
             })
-            
+
+
+        # Parse the master date once
+        show_date_obj = datetime.strptime(SHOW_DATE, "%Y-%m-%d").date()
+
         for prev_show in recent_shows_data:
             # Skip manual EXTRA overrides and Manual Shows (they are freshly processed in 4.5 anyway)
             if prev_show.get('is_extra') or prev_show.get('format') == "Fan Event / Manual": 
@@ -1232,9 +1268,36 @@ if __name__ == "__main__":
             prev_key = f"{prev_t_id}_{clean_str(prev_show.get('time'))}_{clean_str(prev_show.get('format'))}"
             
             matching_current = current_shows_dict.get(prev_key, [])
-            # --- SCENARIO A: The Show Disappeared (Passed Time or Fandango dropped it) ---
+            
+            # --- SCENARIO A: The Show Disappeared ---
             if not matching_current:
-                # Rescue the show
+                
+                # 1. Figure out local time vs show time
+                state = prev_show.get('state', 'New York')
+                tz_name = STATE_TIMEZONES.get(state, 'America/New_York')
+                
+                try:
+                    local_tz = pytz.timezone(tz_name)
+                    current_local_time = datetime.now(local_tz)
+                    parsed_time = parse_fandango_time(prev_show.get('time'))
+                    
+                    is_future_show = False
+                    if parsed_time:
+                        show_datetime_local = local_tz.localize(datetime.combine(show_date_obj, parsed_time))
+                        # The Buffer: We only delete if it's strictly > 1 hour from RIGHT NOW locally
+                        cutoff_time = current_local_time + timedelta(hours=1)
+                        
+                        if show_datetime_local > cutoff_time:
+                            is_future_show = True
+                except Exception as e:
+                    # Fallback: if timezone parsing fails for any reason, safely rescue the show
+                    is_future_show = False
+                    
+                if is_future_show:
+                    dropped_shows_count += 1
+                    continue  # Abort rescuing this show!
+                    
+                # 2. Rescue the past/imminent show
                 master_shows_data.append(prev_show)
                 
                 # Safely patch it back into the master summary
@@ -1253,7 +1316,7 @@ if __name__ == "__main__":
                 rescued_shows_count += 1
                 print(f"🛡️ RESCUED: {prev_show.get('theater')} at {prev_show.get('time')} - Maintained ${prev_show.get('gross', 0):.2f}")
                 
-            # --- SCENARIO B: The Show Exists, but LIVE data might be an API Crash ---
+            # --- SCENARIO B: The Show Exists, check API Crash ---
             else:
                 current_entry = matching_current.pop(0)
                 curr_idx = current_entry['index']
@@ -1282,7 +1345,7 @@ if __name__ == "__main__":
                 # If it's NOT an API crash, we do absolutely nothing.
                 # We strictly trust the live data, even if the gross goes down due to unblocked seats.
 
-        print(f"   => ✅ Cumulative Tracking Complete: Rescued {rescued_shows_count} dropped shows. Patched {protected_shows_count} API errors.")
+        print(f"   => ✅ Cumulative Tracking Complete: Rescued {rescued_shows_count} past shows. Dropped {dropped_shows_count} cancelled future shows. Patched {protected_shows_count} API errors.")
 
     # =========================================================================
     # ── 4.9 SAVE REPORT ARTIFACTS (GitHub Actions Downloadable, Not Committed) ─
