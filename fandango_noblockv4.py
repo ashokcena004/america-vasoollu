@@ -861,7 +861,7 @@ if __name__ == "__main__":
             # ✨ FETCH HASH CACHE ✨
             print("📡 Fetching Global Hash Cache from Firebase...")
             try:
-                hash_ref = db.reference(f"movies/{MOVIE_SLUG}/{SHOW_DATE}/hash_capacity_cache")
+                hash_ref = db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/hash_capacity_cache")
                 cached_hashes = hash_ref.get()
                 if cached_hashes:
                     master_hash_cache = cached_hashes
@@ -883,7 +883,7 @@ if __name__ == "__main__":
     if firebase_initialized:
         print("\n📡 Fetching previous snapshot from Firebase for momentum tracking (last_snapshot)...")
         try:
-            snap_ref = db.reference(f"movies/{MOVIE_SLUG}/{SHOW_DATE}/last_snapshot")
+            snap_ref = db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/last_snapshot")
             snapshot_data = snap_ref.get()
             if snapshot_data and "data" in snapshot_data:
                 previous_shows_data = snapshot_data["data"]
@@ -1421,7 +1421,7 @@ if __name__ == "__main__":
             if new_hash_entries:
                 try:
                     print(f"💾 Saving {len(new_hash_entries)} newly learned Hash Blueprints to Firebase...")
-                    db.reference(f"movies/{MOVIE_SLUG}/{SHOW_DATE}/hash_capacity_cache").update(new_hash_entries)
+                    db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/hash_capacity_cache").update(new_hash_entries)
                     print("✅ Hash Cache updated successfully.")
                 except Exception as e:
                     print(f"⚠️ Failed to update Hash Cache: {e}")
@@ -1430,7 +1430,7 @@ if __name__ == "__main__":
             if OVERWRITE_SNAPSHOT:
                 try:
                     print("💾 Saving current data as the new snapshot to Firebase...")
-                    snap_ref = db.reference(f"movies/{MOVIE_SLUG}/{SHOW_DATE}/last_snapshot")
+                    snap_ref = db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/last_snapshot")
                     snap_ref.set({
                         "timestamp": datetime.utcnow().isoformat() + "Z",
                         "data": master_shows_data
@@ -1445,7 +1445,7 @@ if __name__ == "__main__":
             if recent_shows_data:
                 try:
                     print("💾 Saving previous run data to Firebase (previous_run_snapshot)...")
-                    prev_run_ref = db.reference(f"movies/{MOVIE_SLUG}/{SHOW_DATE}/previous_run_snapshot")
+                    prev_run_ref = db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/previous_run_snapshot")
                     prev_run_ref.set({
                         "timestamp": recent_shows_timestamp,
                         "data": recent_shows_data
@@ -1459,7 +1459,7 @@ if __name__ == "__main__":
             # 3. Save the CURRENT Run Data
             try:
                 print(f"Connecting to Firebase Database: {firebase_db_url}")
-                ref = db.reference(f"movies/{MOVIE_SLUG}/{SHOW_DATE}/master_shows_data")
+                ref = db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/master_shows_data")
                 
                 payload = {
                     "last_updated": datetime.utcnow().isoformat() + "Z",
@@ -1480,7 +1480,7 @@ if __name__ == "__main__":
             # 4. Append to History
             try:
                 print("💾 Appending current run to history in Firebase...")
-                history_ref = db.reference(f"movies/{MOVIE_SLUG}/{SHOW_DATE}/history")
+                history_ref = db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/history")
                 
                 calc_shows = [r for r in master_shows_data if not r.get('is_extra')]
                 venues_count = len(set(r.get('t_id') for r in calc_shows))
