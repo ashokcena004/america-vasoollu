@@ -1458,7 +1458,7 @@ if __name__ == "__main__":
 
             # 3. Save the CURRENT Run Data
             try:
-                print(f"Connecting to Firebase Database: {firebase_db_url}")
+                print(f"Connecting to Firebase Database to upload current data: {firebase_db_url}")
                 ref = db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/master_shows_data")
                 
                 payload = {
@@ -1473,6 +1473,13 @@ if __name__ == "__main__":
                 ref.set(payload)
                 
                 print("✅ Successfully uploaded master_shows_data to Firebase!")
+
+                # Advance Sales Snapshot
+                if not CUMULATIVE_TRACKING_MODE:
+                    db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/advance_snapshot"
+                    ).set(payload)
+
+                    print("🔥 Successfully updated advance_snapshot!")
             except Exception as e:
                 print(f"❌ Failed to upload to Firebase: {e}")
                 traceback.print_exc()
