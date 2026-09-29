@@ -902,7 +902,7 @@ if __name__ == "__main__":
 
         print("\n📡 Fetching previous run data from Firebase (master_shows_data) for Missing Shows detection...")
         try:
-            master_ref = db.reference(f"movies/{MOVIE_SLUG}/{SHOW_DATE}/master_shows_data")
+            master_ref = db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/master_shows_data")
             master_data = master_ref.get()
             if master_data and "data" in master_data:
                 recent_shows_data = master_data["data"]
