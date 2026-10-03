@@ -1038,10 +1038,10 @@ if __name__ == "__main__":
                 'seat_map_urls': item.get('seat_map_urls', '')
             })
 
-        master_summary_data[t_id]['shows'] += 1
-        master_summary_data[t_id]['total'] += combined_total
-        master_summary_data[t_id]['booked'] += combined_booked
-        master_summary_data[t_id]['gross'] += combined_gross
+            master_summary_data[t_id]['shows'] += 1
+            master_summary_data[t_id]['total'] += combined_total
+            master_summary_data[t_id]['booked'] += combined_booked
+            master_summary_data[t_id]['gross'] += combined_gross
 
     # =========================================================================
     # ── 4.5 MANUAL SHOWS PROCESSING ──────────────────────────────────────────
