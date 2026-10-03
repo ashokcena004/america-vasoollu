@@ -177,7 +177,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         
                         # 2. EXTRACT FORMAT SCANNER ONLY FOR REPORTS
                         show_format = base_format
-                        premium_keywords = ["XD", "RPX", "IMAX", "4DX", "3D"]
+                        premium_keywords = ["XD", "RPX", "IMAX", "4DX", "3D", "D-BOX"]
                         for am_name in raw_amenities_upper:
                             if any(k in am_name for k in premium_keywords) and show_format == base_format:
                                 show_format = am_name
