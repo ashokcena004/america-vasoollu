@@ -1,3 +1,6 @@
+# If D-BOX shows are not merging properly with base show. Try removing more amenities like luxury seating etc... so shows can match. line 199.
+# Currently assuming only D-BOX will have its separate tier. If finding exaggerated shows count, try chexking Premium shows if some other formats also having separate tiers
+
 import time
 from datetime import datetime, timezone, timedelta
 import json
