@@ -46,6 +46,7 @@ MANUAL_SHOWS = [
     #["New Jersey", "AAEMI", "6:20 PM", 3125.0, 3125.0, 125, 125, 1.0, "Manual", "Telugu"],
     #["New Jersey", "AAEMI", "6:35 PM", 3125.0, 3125.0, 125, 125, 1.0, "Manual", "Telugu"],
     # ["EXTRA", "", "", 4000.0, 0, 160]
+    ["EXTRA", "", "", 13300.0, 0, 530] # Cinelounge Fremont Fans Show
 ]
 
 EXTRA_GROSS_NOTE = "Added extra gross for fans shows which are not added in fandano yet."
@@ -1013,56 +1014,40 @@ if __name__ == "__main__":
     # =========================================================================
     # ── 4. SOLD-OUT QUEUE (MANUAL REVIEW) ───────────────────────────────────
     # =========================================================================
-    # if master_sold_out_queue:
-    #     print(f"\n� Processing {len(master_sold_out_queue)} Total Sold Out shows from Queue...")
+    if master_sold_out_queue:
+        print(f"\n� Processing {len(master_sold_out_queue)} Total Sold Out shows from Queue...")
         
-    #     for item in master_sold_out_queue:
-    #         t_id = item['t_id']
-    #         fmt = item['format']
-    #         kb_key = f"{t_id}_{fmt}"
+        for item in master_sold_out_queue:
+            t_id = item['t_id']
+            fmt = item['format']
 
-    #         if kb_key in master_knowledge_base:
-    #             kb_data = master_knowledge_base[kb_key]
-    #             avg_seats = int(kb_data['total_seats_sum'] / kb_data['count'])
-    #             est_price = min(kb_data['prices']) if kb_data['prices'] else AVG_PRICE
-
-    #             if PRICE_TAX_CUT and est_price > 0:
-    #                 est_price = float((est_price // 5) * 5)
-
-    #             combined_total = avg_seats
-    #             combined_booked = avg_seats
-    #             combined_gross = avg_seats * est_price
-    #             price_str = f"${est_price:.2f}"
+            combined_total = 0 #FALLBACK_SEATS
+            combined_booked = 0 #FALLBACK_SEATS
+            
+            est_price = AVG_PRICE
+            if PRICE_TAX_CUT and est_price > 0:
+                est_price = float((est_price // 5) * 5)
                 
-    #             print(f"   => ✅ Recovered {item['theater']} [{fmt}] at {item['time']} via Cross-Reference.")
-    #         else:
-    #             combined_total = 0 #FALLBACK_SEATS
-    #             combined_booked = 0 #FALLBACK_SEATS
-                
-    #             est_price = AVG_PRICE
-    #             if PRICE_TAX_CUT and est_price > 0:
-    #                 est_price = float((est_price // 5) * 5)
-                    
-    #             combined_gross = 0 #FALLBACK_SEATS * est_price
-    #             price_str = 0 #f"${est_price:.2f}"
-                
-    #             log_entry = f"( {item['state']} ) {item['theater']} - {item['time']} [{fmt}] - Added ${combined_gross:,.2f}"
-    #             blind_fallback_log.append(log_entry)
-                
-    #             print(f"   => ⚠️ Blind Fallback used for {item['theater']} [{fmt}] at {item['time']}. Please check this show and add gross/tickets manually!")
+            combined_gross = 0 #FALLBACK_SEATS * est_price
+            price_str = 0 #f"${est_price:.2f}"
+            
+            log_entry = f"( {item['state']} ) {item['theater']} - {item['time']} [{fmt}] - Added ${combined_gross:,.2f}"
+            blind_fallback_log.append(log_entry)
+            
+            print(f"   => ⚠️ Blind Fallback used for {item['theater']} [{fmt}] at {item['time']}. Please check this show and add gross/tickets manually!")
 
-    #         master_shows_data.append({
-    #             'state': item['state'], 't_id': t_id, 'theater': item['theater'],
-    #             'format': fmt, 'language': item.get('language', DEFAULT_LANGUAGE), 'time': item['time'], 'status': "Sold Out",
-    #             'price_str': price_str, 'total': combined_total,
-    #             'booked': combined_booked, 'gross': combined_gross,
-    #             'seat_map_urls': item.get('seat_map_urls', '')
-    #         })
+        master_shows_data.append({
+            'state': item['state'], 't_id': t_id, 'theater': item['theater'],
+            'format': fmt, 'language': item.get('language', DEFAULT_LANGUAGE), 'time': item['time'], 'status': "Sold Out",
+            'price_str': price_str, 'total': combined_total,
+            'booked': combined_booked, 'gross': combined_gross,
+            'seat_map_urls': item.get('seat_map_urls', '')
+        })
 
-    #         master_summary_data[t_id]['shows'] += 1
-    #         master_summary_data[t_id]['total'] += combined_total
-    #         master_summary_data[t_id]['booked'] += combined_booked
-    #         master_summary_data[t_id]['gross'] += combined_gross
+        master_summary_data[t_id]['shows'] += 1
+        master_summary_data[t_id]['total'] += combined_total
+        master_summary_data[t_id]['booked'] += combined_booked
+        master_summary_data[t_id]['gross'] += combined_gross
 
     # =========================================================================
     # ── 4.5 MANUAL SHOWS PROCESSING ──────────────────────────────────────────
