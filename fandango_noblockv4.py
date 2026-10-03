@@ -174,6 +174,14 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         # 1. Get all amenities as clean uppercase strings
                         raw_amenities_upper = [am.get('name', '').strip().upper() for am in amenity.get('amenities', []) if am.get('name')]
                         
+                        # ✨ EXTRACT FORMAT SCANNER ONLY FOR REPORTS
+                        show_format = base_format
+                        premium_keywords = ["XD", "IMAX", "3D", "DOLBY", "SCREENX", "4DX", "RPX", "PRIME", "BIGD", "XPLUS", "D-BOX", "70MM", "SONY", "DFX", "LASER", "ATMOS"]
+                        for am_name in raw_amenities_upper:
+                            if any(k in am_name for k in premium_keywords) and show_format == base_format:
+                                show_format = am_name
+                                break
+                        
                         # 2. Extract Language purely for your Excel reports
                         show_language = DEFAULT_LANGUAGE
                         language_keywords = ["TELUGU", "HINDI", "TAMIL", "MALAYALAM", "KANNADA"]
@@ -190,9 +198,6 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         signature_amenities = [a for a in raw_amenities_upper if "D-BOX" not in a and "DBOX" not in a]
                         signature_amenities.sort()
                         room_signature = "|".join(signature_amenities) if signature_amenities else "STANDARD"
-                        
-                        # Clean display format for reports
-                        display_format = f"{base_format} / D-Box" if has_dbox else base_format
                         
                         for show in amenity.get('showtimes', []):
                             show_hash = show.get('showtimeHashCode')
@@ -212,7 +217,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                             grouped_shows[group_key]['tiers'].append({
                                 'hash': show_hash, 
                                 'status': status, 
-                                'format': display_format, 
+                                'format': show_format, 
                                 'language': show_language 
                             })
             
@@ -1009,58 +1014,58 @@ if __name__ == "__main__":
         )
 
     # =========================================================================
-    # ── 4. QUEUE PROCESSING (Cross-Referencing) ──────────────────────────────
+    # ── 4. SOLD-OUT QUEUE (MANUAL REVIEW) ───────────────────────────────────
     # =========================================================================
-    if master_sold_out_queue:
-        print(f"\n🔄 Processing {len(master_sold_out_queue)} Total Sold Out shows from Queue...")
+    # if master_sold_out_queue:
+    #     print(f"\n� Processing {len(master_sold_out_queue)} Total Sold Out shows from Queue...")
         
-        for item in master_sold_out_queue:
-            t_id = item['t_id']
-            fmt = item['format']
-            kb_key = f"{t_id}_{fmt}"
+    #     for item in master_sold_out_queue:
+    #         t_id = item['t_id']
+    #         fmt = item['format']
+    #         kb_key = f"{t_id}_{fmt}"
 
-            if kb_key in master_knowledge_base:
-                kb_data = master_knowledge_base[kb_key]
-                avg_seats = int(kb_data['total_seats_sum'] / kb_data['count'])
-                est_price = min(kb_data['prices']) if kb_data['prices'] else AVG_PRICE
+    #         if kb_key in master_knowledge_base:
+    #             kb_data = master_knowledge_base[kb_key]
+    #             avg_seats = int(kb_data['total_seats_sum'] / kb_data['count'])
+    #             est_price = min(kb_data['prices']) if kb_data['prices'] else AVG_PRICE
 
-                if PRICE_TAX_CUT and est_price > 0:
-                    est_price = float((est_price // 5) * 5)
+    #             if PRICE_TAX_CUT and est_price > 0:
+    #                 est_price = float((est_price // 5) * 5)
 
-                combined_total = avg_seats
-                combined_booked = avg_seats
-                combined_gross = avg_seats * est_price
-                price_str = f"${est_price:.2f}"
+    #             combined_total = avg_seats
+    #             combined_booked = avg_seats
+    #             combined_gross = avg_seats * est_price
+    #             price_str = f"${est_price:.2f}"
                 
-                print(f"   => ✅ Recovered {item['theater']} [{fmt}] at {item['time']} via Cross-Reference.")
-            else:
-                combined_total = 0 #FALLBACK_SEATS
-                combined_booked = 0 #FALLBACK_SEATS
+    #             print(f"   => ✅ Recovered {item['theater']} [{fmt}] at {item['time']} via Cross-Reference.")
+    #         else:
+    #             combined_total = 0 #FALLBACK_SEATS
+    #             combined_booked = 0 #FALLBACK_SEATS
                 
-                est_price = AVG_PRICE
-                if PRICE_TAX_CUT and est_price > 0:
-                    est_price = float((est_price // 5) * 5)
+    #             est_price = AVG_PRICE
+    #             if PRICE_TAX_CUT and est_price > 0:
+    #                 est_price = float((est_price // 5) * 5)
                     
-                combined_gross = 0 #FALLBACK_SEATS * est_price
-                price_str = 0 #f"${est_price:.2f}"
+    #             combined_gross = 0 #FALLBACK_SEATS * est_price
+    #             price_str = 0 #f"${est_price:.2f}"
                 
-                log_entry = f"( {item['state']} ) {item['theater']} - {item['time']} [{fmt}] - Added ${combined_gross:,.2f}"
-                blind_fallback_log.append(log_entry)
+    #             log_entry = f"( {item['state']} ) {item['theater']} - {item['time']} [{fmt}] - Added ${combined_gross:,.2f}"
+    #             blind_fallback_log.append(log_entry)
                 
-                print(f"   => ⚠️ Blind Fallback used for {item['theater']} [{fmt}] at {item['time']}. Please check this show and add gross/tickets manually!")
+    #             print(f"   => ⚠️ Blind Fallback used for {item['theater']} [{fmt}] at {item['time']}. Please check this show and add gross/tickets manually!")
 
-            master_shows_data.append({
-                'state': item['state'], 't_id': t_id, 'theater': item['theater'],
-                'format': fmt, 'language': item.get('language', DEFAULT_LANGUAGE), 'time': item['time'], 'status': "Sold Out",
-                'price_str': price_str, 'total': combined_total,
-                'booked': combined_booked, 'gross': combined_gross,
-                'seat_map_urls': item.get('seat_map_urls', '')
-            })
+    #         master_shows_data.append({
+    #             'state': item['state'], 't_id': t_id, 'theater': item['theater'],
+    #             'format': fmt, 'language': item.get('language', DEFAULT_LANGUAGE), 'time': item['time'], 'status': "Sold Out",
+    #             'price_str': price_str, 'total': combined_total,
+    #             'booked': combined_booked, 'gross': combined_gross,
+    #             'seat_map_urls': item.get('seat_map_urls', '')
+    #         })
 
-            master_summary_data[t_id]['shows'] += 1
-            master_summary_data[t_id]['total'] += combined_total
-            master_summary_data[t_id]['booked'] += combined_booked
-            master_summary_data[t_id]['gross'] += combined_gross
+    #         master_summary_data[t_id]['shows'] += 1
+    #         master_summary_data[t_id]['total'] += combined_total
+    #         master_summary_data[t_id]['booked'] += combined_booked
+    #         master_summary_data[t_id]['gross'] += combined_gross
 
     # =========================================================================
     # ── 4.5 MANUAL SHOWS PROCESSING ──────────────────────────────────────────
@@ -1392,16 +1397,22 @@ if __name__ == "__main__":
                 print(log)
             print("=====================================================================\n")
 
-        if blind_fallback_log:
+        if master_sold_out_queue:
             print("\n=====================================================================")
-            print("⚠️ BLIND FALLBACK LOG (Highly Inaccurate Estimates)")
-            print("The following shows were completely sold out and had no other open. Please check these shows and add gross/tickets manually!")
-            print(f"shows to cross-reference. We forced {FALLBACK_SEATS} seats @ following prices.")
+            print("⚠️ SOLD-OUT SHOWS WITHOUT DATA — MANUAL REVIEW REQUIRED")
+            print("These shows are sold out, but seat-map data was unavailable.")
+            print("Check their actual gross/tickets, then add verified values to MANUAL_SHOWS.")
+            print("They were not estimated or included in the report totals.")
             print("=====================================================================")
-            for log in blind_fallback_log:
-                print(log)
+            for item in master_sold_out_queue:
+                print(
+                    f"( {item['state']} ) {item['theater']} - {item['time']} "
+                    f"[{item['format']} | {item.get('language', DEFAULT_LANGUAGE)}]"
+                )
+                if item.get('seat_map_urls'):
+                    print(f"   Seat map URL(s): {item['seat_map_urls']}")
             print("=====================================================================\n")
-        
+
         if ignored_soldout_chain_log:
             print("\n=====================================================================")
             print("🚫 IGNORED SOLD OUT SHOWS (Specific Chains)")
