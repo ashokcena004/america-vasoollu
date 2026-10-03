@@ -174,7 +174,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         # 1. Get all amenities as clean uppercase strings
                         raw_amenities_upper = [am.get('name', '').strip().upper() for am in amenity.get('amenities', []) if am.get('name')]
                         
-                        # ✨ EXTRACT FORMAT SCANNER ONLY FOR REPORTS
+                        # 2. EXTRACT FORMAT SCANNER ONLY FOR REPORTS
                         show_format = base_format
                         premium_keywords = ["XD", "IMAX", "3D", "DOLBY", "SCREENX", "4DX", "RPX", "PRIME", "BIGD", "XPLUS", "D-BOX", "70MM", "SONY", "DFX", "LASER", "ATMOS"]
                         for am_name in raw_amenities_upper:
@@ -182,7 +182,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                 show_format = am_name
                                 break
                         
-                        # 2. Extract Language purely for your Excel reports
+                        # 3. Extract Language purely for your Excel reports
                         show_language = DEFAULT_LANGUAGE
                         language_keywords = ["TELUGU", "HINDI", "TAMIL", "MALAYALAM", "KANNADA"]
                         for am_up in raw_amenities_upper:
@@ -190,9 +190,6 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                 if lang in am_up and show_language == DEFAULT_LANGUAGE:
                                     show_language = lang.capitalize()
                                     break
-                        
-                        # 3. Detect D-Box for display formatting
-                        has_dbox = any("D-BOX" in a or "DBOX" in a for a in raw_amenities_upper)
                         
                         # 4. THE AMENITY SIGNATURE (The Master Grouper)
                         signature_amenities = [a for a in raw_amenities_upper if "D-BOX" not in a and "DBOX" not in a]
