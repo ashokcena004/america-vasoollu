@@ -406,9 +406,24 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         seats_array = vt['data'].get('seats', [])
                         seat_ids = set(s.get('id') for s in seats_array if s.get('id'))
                         vt_available_seats = get_available_seat_ids(seats_array)
+
+                        # ✨ 1. Extract the format for the current tier being checked
+                        vt_fmt = vt['tier_info'].get('format', 'Standard').upper()
                         
                         matched = False
                         for cluster in clusters:
+                            # ✨ 2. STRICT FORMAT COMPATIBILITY CHECK
+                            cluster_formats = [t['tier_info'].get('format', 'Standard').upper() for t in cluster['tiers']]
+                            
+                            vt_is_xd = "XD" in vt_fmt
+                            vt_is_standard = "STANDARD" in vt_fmt
+                            cluster_has_xd = any("XD" in f for f in cluster_formats)
+                            cluster_has_standard = any("STANDARD" in f for f in cluster_formats)
+                            
+                            # If trying to mix Standard and XD, abort this cluster match immediately
+                            if (vt_is_xd and cluster_has_standard) or (vt_is_standard and cluster_has_xd):
+                                continue
+                            
                             vt_svg = vt['data'].get('backgroundSvg', '')
                             cluster_svg = cluster['tiers'][0]['data'].get('backgroundSvg', '')
                             
