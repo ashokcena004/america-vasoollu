@@ -1032,7 +1032,7 @@ if __name__ == "__main__":
             
             master_shows_data.append({
                 'state': item['state'], 't_id': t_id, 'theater': item['theater'],
-                'format': fmt, 'language': item.get('language', DEFAULT_LANGUAGE), 'time': item['time'], 'status': "Sold Out",
+                'format': fmt, 'language': item.get('language', DEFAULT_LANGUAGE), 'time': item['time'], 'status': "Sold Out (EXTRA)",
                 'price_str': price_str, 'total': combined_total,
                 'booked': combined_booked, 'gross': combined_gross,
                 'seat_map_urls': item.get('seat_map_urls', '')
