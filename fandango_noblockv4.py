@@ -422,6 +422,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                             
                             # If trying to mix Standard and XD, abort this cluster match immediately
                             if (vt_is_xd and cluster_has_standard) or (vt_is_standard and cluster_has_xd):
+                                print(f"   => 🚫 BLOCKED MERGE: {t_name} at {show_time} | Prevented mixing '{vt_fmt}' with '{' / '.join(cluster_formats)}'")
                                 continue
                             
                             vt_svg = vt['data'].get('backgroundSvg', '')
