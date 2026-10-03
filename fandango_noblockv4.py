@@ -24,12 +24,12 @@ from utils.generateFandangoImageReport import generate_fandango_image_report
 # ── 1. CONFIGURATION ─────────────────────────────────────────────────────────
 # =============================================================================
 
-SHOW_DATE = "2026-10-02"
-URL = "https://www.fandango.com/the-paradise-2026-246366/movie-overview"
+SHOW_DATE = "2026-10-14"
+URL = "https://www.fandango.com/jailer-2-247862/movie-overview"
 
 # 🚨 FALLBACK & PRICING CONFIGURATION
-AVG_PRICE = 20.00
-MAX_TIER_PRICE = 20.00 #XD D-Box Pricing
+AVG_PRICE = 32.00
+MAX_TIER_PRICE = 32.00 #XD D-Box Pricing
 DEFAULT_LANGUAGE = "Telugu"
 FALLBACK_SEATS = 100
 PRICE_TAX_CUT = False  # If True, rounds ticket prices down to nearest multiple of 5 (e.g., $29 -> $25)
@@ -52,7 +52,7 @@ EXTRA_GROSS_NOTE = "Added extra gross for fans shows which are not added in fand
 
 MAPPING_FILE = "state_theatre_mapping.json"
 OVERWRITE_SNAPSHOT = os.getenv("OVERWRITE_SNAPSHOT", "false").lower() == "true" # ⚠️ Set to True to update the baseline after this run
-CUMULATIVE_TRACKING_MODE = True
+CUMULATIVE_TRACKING_MODE = False
 
 SEAT_COUNT_MODE = 1
 # 1 = Use physical seat map count when available (more accurate but slower)
