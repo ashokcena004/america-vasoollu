@@ -177,7 +177,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         
                         # 2. EXTRACT FORMAT SCANNER ONLY FOR REPORTS
                         show_format = base_format
-                        premium_keywords = ["XD", "IMAX", "3D", "DOLBY", "SCREENX", "4DX", "RPX", "PRIME", "BIGD", "XPLUS", "D-BOX", "70MM", "SONY", "DFX", "LASER", "ATMOS"]
+                        premium_keywords = ["XD", "RPX", "IMAX", "4DX", "3D"]
                         for am_name in raw_amenities_upper:
                             if any(k in am_name for k in premium_keywords) and show_format == base_format:
                                 show_format = am_name
@@ -193,7 +193,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                     break
                         
                         # 4. THE AMENITY SIGNATURE (The Master Grouper)
-                        signature_amenities = [a for a in raw_amenities_upper if "D-BOX" not in a and "DBOX" not in a]
+                        signature_amenities = [a for a in raw_amenities_upper if "D-BOX" not in a and "DBOX" not in a and "RESERVED" not in a and "RECLINERS" not in a]
                         signature_amenities.sort()
                         room_signature = "|".join(signature_amenities) if signature_amenities else "STANDARD"
                         
