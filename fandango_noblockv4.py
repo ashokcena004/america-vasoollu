@@ -171,28 +171,28 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                     if not base_format: base_format = 'Standard'
 
                     for amenity in variant.get('amenityGroups', []):
-                        show_format = base_format
-                        show_language = DEFAULT_LANGUAGE
-                        premium_keywords = ["XD", "IMAX", "3D", "DOLBY", "SCREENX", "4DX", "RPX", "PRIME", "BIGD", "XPLUS", "D-BOX", "70MM"]
-                        language_keywords = ["TELUGU", "HINDI", "TAMIL", "MALAYALAM", "KANNADA"]
+                        # 1. Get all amenities as clean uppercase strings
+                        raw_amenities_upper = [am.get('name', '').strip().upper() for am in amenity.get('amenities', []) if am.get('name')]
                         
-                        # Extract Format & Language
-                        for am in amenity.get('amenities', []):
-                            am_name = am.get('name', '')
-                            am_upper = am_name.upper()
-                            
-                            # Format Check
-                            if any(k in am_upper for k in premium_keywords) and show_format == base_format:
-                                show_format = am_name
-                            
-                            # Language Targeted Scanner
+                        # 2. Extract Language purely for your Excel reports
+                        show_language = DEFAULT_LANGUAGE
+                        language_keywords = ["TELUGU", "HINDI", "TAMIL", "MALAYALAM", "KANNADA"]
+                        for am_up in raw_amenities_upper:
                             for lang in language_keywords:
-                                # Prioritize the first matched language in our defined list.
-                                # Because "TELUGU" comes before "ENGLISH" in our list, 
-                                # "Telugu with English Subtitles" will safely match "TELUGU" and lock it in.
-                                if lang in am_upper and show_language == DEFAULT_LANGUAGE:
+                                if lang in am_up and show_language == DEFAULT_LANGUAGE:
                                     show_language = lang.capitalize()
                                     break
+                        
+                        # 3. Detect D-Box for display formatting
+                        has_dbox = any("D-BOX" in a or "DBOX" in a for a in raw_amenities_upper)
+                        
+                        # 4. THE AMENITY SIGNATURE (The Master Grouper)
+                        signature_amenities = [a for a in raw_amenities_upper if "D-BOX" not in a and "DBOX" not in a]
+                        signature_amenities.sort()
+                        room_signature = "|".join(signature_amenities) if signature_amenities else "STANDARD"
+                        
+                        # Clean display format for reports
+                        display_format = f"{base_format} / D-Box" if has_dbox else base_format
                         
                         for show in amenity.get('showtimes', []):
                             show_hash = show.get('showtimeHashCode')
@@ -201,13 +201,20 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                             show_time = show.get('screenReaderTime', 'Unknown')
                             status = show.get('type', 'Unknown')
                             
-                            group_key = f"{t_id}_{show_time}"
+                            # 5. Group strictly by Time + The Signature
+                            group_key = f"{t_id}_{show_time}_{room_signature}"
+                            
                             if group_key not in grouped_shows:
                                 grouped_shows[group_key] = {
                                     'state': target_state, 'theater': t_name,
                                     't_id': t_id, 'time': show_time, 'tiers': []
                                 }
-                            grouped_shows[group_key]['tiers'].append({'hash': show_hash, 'status': status, 'format': show_format, 'language': show_language})
+                            grouped_shows[group_key]['tiers'].append({
+                                'hash': show_hash, 
+                                'status': status, 
+                                'format': display_format, 
+                                'language': show_language 
+                            })
             
             except Exception as e:
                 print(f"[Thread-{thread_id}] EXCEPTION processing theater {t_name}: {e}")
@@ -409,25 +416,9 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         seats_array = vt['data'].get('seats', [])
                         seat_ids = set(s.get('id') for s in seats_array if s.get('id'))
                         vt_available_seats = get_available_seat_ids(seats_array)
-
-                        # ✨ 1. Extract the format for the current tier being checked
-                        vt_fmt = vt['tier_info'].get('format', 'Standard').upper()
                         
                         matched = False
                         for cluster in clusters:
-                            # ✨ 2. STRICT FORMAT COMPATIBILITY CHECK
-                            cluster_formats = [t['tier_info'].get('format', 'Standard').upper() for t in cluster['tiers']]
-                            
-                            vt_is_xd = "XD" in vt_fmt
-                            vt_is_standard = "STANDARD" in vt_fmt
-                            cluster_has_xd = any("XD" in f for f in cluster_formats)
-                            cluster_has_standard = any("STANDARD" in f for f in cluster_formats)
-                            
-                            # If trying to mix Standard and XD, abort this cluster match immediately
-                            if (vt_is_xd and cluster_has_standard) or (vt_is_standard and cluster_has_xd):
-                                print(f"   => 🚫 BLOCKED MERGE: {t_name} at {show_time} | Prevented mixing '{vt_fmt}' with '{' / '.join(cluster_formats)}'")
-                                continue
-                            
                             vt_svg = vt['data'].get('backgroundSvg', '')
                             cluster_svg = cluster['tiers'][0]['data'].get('backgroundSvg', '')
                             
