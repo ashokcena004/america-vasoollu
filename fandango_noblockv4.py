@@ -109,6 +109,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
     local_sold_out_queue = []
     local_ignored_shows_log = []
     local_hash_cache = {} # ✨ NEW: Stores the hashes learned in this thread
+    local_hash_healed_log = [] # ✨ NEW: Tracks successfully healed shows in this thread
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
@@ -354,6 +355,8 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                 local_summary_data[t_id]['gross'] += c_gross
 
                                 print(f"   => 🟢 SELF-HEALED (All-Failed) via Hash Cache: {t_name} at {show_time} [{final_format}]")
+                                # ✨ NEW: Add to our new summary log
+                                local_hash_healed_log.append(f"( {target_state} ) {t_name} - {show_time} [{final_format}] - Healed {c_total} seats | ${c_gross:,.2f}")
                                 continue # Bypass standard S9/S10 failure logic!
                         
                         if has_generic_error:
@@ -743,6 +746,10 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         price_str = " / ".join(sorted([f"${p:.2f}" for p in prices_seen])) if prices_seen else "$0.00"
                         
                         print(f"   => 📊 Seats: {combined_total:<3} | Booked: {combined_booked:<3} | Gross: ${combined_gross:<7.2f} [{calc_method_log}]")
+
+                        # ✨ NEW: If the matrix used the hash cache, add it to the summary log
+                        if "Hash Healed" in calc_method_log:
+                            local_hash_healed_log.append(f"( {target_state} ) {t_name} - {show_time} [{final_format}] - Healed {combined_total} seats | ${combined_gross:,.2f}")
                         
                         local_shows_data.append({
                             'state': target_state, 't_id': t_id, 'theater': t_name, 
@@ -769,7 +776,8 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
         "knowledge_base": local_knowledge_base,
         "sold_out_queue": local_sold_out_queue,
         "ignored_log": local_ignored_shows_log,
-        "hash_cache": local_hash_cache # ✨ NEW
+        "hash_cache": local_hash_cache, # ✨ NEW
+        "hash_healed_log": local_hash_healed_log # ✨ NEW
     }
 
 
@@ -852,6 +860,7 @@ if __name__ == "__main__":
     master_sold_out_queue = []
     master_ignored_shows_log = []
     blind_fallback_log = []
+    master_hash_healed_log = [] # ✨ NEW
 
     # =========================================================================
     # ── 3.5 FIREBASE SETUP & FETCHING PREVIOUS RUN (Replaces Excel logic) ────
@@ -942,6 +951,7 @@ if __name__ == "__main__":
                     master_shows_data.extend(result["shows_data"])
                     master_sold_out_queue.extend(result["sold_out_queue"])
                     master_ignored_shows_log.extend(result["ignored_log"])
+                    master_hash_healed_log.extend(result["hash_healed_log"]) # ✨ NEW
                     
                     # Merge Summary Dictionaries
                     for t_id, data in result["summary_data"].items():
@@ -1380,11 +1390,21 @@ if __name__ == "__main__":
     if master_shows_data:
         print(f"\n🚀 Preparing to process momentum and upload data...")
 
+        if master_hash_healed_log:
+            print("\n=====================================================================")
+            print("🟢 HASH CACHE HEALED SHOWS (100% Accurate Recovery)")
+            print("The following Sold Out shows crashed the Fandango API, but their exact")
+            print("physical seating capacities and prices were instantly restored using Firebase memory.")
+            print("=====================================================================")
+            for log in master_hash_healed_log:
+                print(log)
+            print("=====================================================================\n")
+
         if blind_fallback_log:
             print("\n=====================================================================")
             print("⚠️ BLIND FALLBACK LOG (Highly Inaccurate Estimates)")
             print("The following shows were completely sold out and had no other open. Please check these shows and add gross/tickets manually!")
-            print(f"shows to cross-reference. We forced {FALLBACK_SEATS} seats @ ${AVG_PRICE:.2f}.")
+            print(f"shows to cross-reference. We forced {FALLBACK_SEATS} seats @ following prices.")
             print("=====================================================================")
             for log in blind_fallback_log:
                 print(log)
