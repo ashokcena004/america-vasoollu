@@ -854,7 +854,6 @@ if __name__ == "__main__":
     master_knowledge_base = {} 
     master_sold_out_queue = []
     master_ignored_shows_log = []
-    blind_fallback_log = []
     master_hash_healed_log = [] # ✨ NEW
 
     # =========================================================================
@@ -1031,18 +1030,13 @@ if __name__ == "__main__":
             combined_gross = 0 #FALLBACK_SEATS * est_price
             price_str = 0 #f"${est_price:.2f}"
             
-            log_entry = f"( {item['state']} ) {item['theater']} - {item['time']} [{fmt}] - Added ${combined_gross:,.2f}"
-            blind_fallback_log.append(log_entry)
-            
-            print(f"   => ⚠️ Blind Fallback used for {item['theater']} [{fmt}] at {item['time']}. Please check this show and add gross/tickets manually!")
-
-        master_shows_data.append({
-            'state': item['state'], 't_id': t_id, 'theater': item['theater'],
-            'format': fmt, 'language': item.get('language', DEFAULT_LANGUAGE), 'time': item['time'], 'status': "Sold Out",
-            'price_str': price_str, 'total': combined_total,
-            'booked': combined_booked, 'gross': combined_gross,
-            'seat_map_urls': item.get('seat_map_urls', '')
-        })
+            master_shows_data.append({
+                'state': item['state'], 't_id': t_id, 'theater': item['theater'],
+                'format': fmt, 'language': item.get('language', DEFAULT_LANGUAGE), 'time': item['time'], 'status': "Sold Out",
+                'price_str': price_str, 'total': combined_total,
+                'booked': combined_booked, 'gross': combined_gross,
+                'seat_map_urls': item.get('seat_map_urls', '')
+            })
 
         master_summary_data[t_id]['shows'] += 1
         master_summary_data[t_id]['total'] += combined_total
