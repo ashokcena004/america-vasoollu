@@ -743,7 +743,11 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                             final_status = "Sold Out" if combined_booked >= combined_total and combined_total > 0 else "Available"
                         price_str = " / ".join(sorted([f"${p:.2f}" for p in prices_seen])) if prices_seen else "$0.00"
                         
-                        print(f"   => 📊 Seats: {combined_total:<3} | Booked: {combined_booked:<3} | Gross: ${combined_gross:<7.2f} [{calc_method_log}]")
+                        print(
+                            f"   => 📊 {t_name} | {show_time} | {final_format} | "
+                            f"Seats: {combined_total:<3} | Booked: {combined_booked:<3} | "
+                            f"Gross: ${combined_gross:<7.2f} [{calc_method_log}]"
+                        )
 
                         # ✨ NEW: If the matrix used the hash cache, add it to the summary log
                         if "Hash Healed" in calc_method_log:
