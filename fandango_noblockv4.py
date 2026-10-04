@@ -176,13 +176,14 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
 
                     for amenity in variant.get('amenityGroups', []):
                         # 1. Get all amenities as clean uppercase strings
-                        raw_amenities_upper = [am.get('name', '').strip().upper() for am in amenity.get('amenities', []) if am.get('name')]
+                        raw_amenities = [am.get('name', '').strip() for am in amenity.get('amenities', []) if am.get('name')]
+                        raw_amenities_upper = [a.upper() for a in raw_amenities]
                         
-                        # 2. EXTRACT FORMAT SCANNER ONLY FOR REPORTS
+                        # 2. EXTRACT FORMAT SCANNER ONLY FOR REPORTS (Restores precise casing)
                         show_format = base_format
-                        premium_keywords = ["XD", "RPX", "IMAX", "4DX", "3D", "D-BOX"]
-                        for am_name in raw_amenities_upper:
-                            if any(k in am_name for k in premium_keywords) and show_format == base_format:
+                        premium_keywords = ["XD", "IMAX", "3D", "DOLBY", "SCREENX", "4DX", "RPX", "PRIME", "BIGD", "XPLUS", "D-BOX", "70MM", "SONY", "DFX", "LASER", "ATMOS"]
+                        for am_name, am_up in zip(raw_amenities, raw_amenities_upper):
+                            if any(k in am_up for k in premium_keywords) and show_format == base_format:
                                 show_format = am_name
                                 break
                         
@@ -243,7 +244,11 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                             }} catch(e) {{ return {{ error: "Fetch Exception: " + e.message }}; }}
                         }}""")
                         
-                        if seat_response and "error" not in seat_response:
+                        # ✨ FIX: Intercept explicit PerformanceSoldOut list responses
+                        if isinstance(seat_response, list) and len(seat_response) > 0 and seat_response[0].get("id") == "PerformanceSoldOut":
+                            tier['status'] = 'Sold Out'
+                            show_info['failed_tiers'].append(tier)
+                        elif seat_response and isinstance(seat_response, dict) and "error" not in seat_response:
                             show_info['valid_tiers'].append({'data': seat_response.get('data', seat_response), 'tier_info': tier})
                         else:
                             show_info['failed_tiers'].append(tier)
@@ -326,51 +331,71 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         
                         # ✨ HASH CACHE SELF-HEALING (All Tiers Failed)
                         if len(failed_tiers) > 0 and not has_generic_error:
-                            all_cached = True
-                            c_total = 0
-                            c_booked = 0
-                            c_gross = 0.0
-                            c_prices = set()
+                            # 1. Separate Base tiers from D-Box overlay tiers
+                            base_failed = [ft for ft in failed_tiers if "D-BOX" not in ft['format'].upper() and "DBOX" not in ft['format'].upper()]
+                            dbox_failed = [ft for ft in failed_tiers if "D-BOX" in ft['format'].upper() or "DBOX" in ft['format'].upper()]
                             
-                            for ft in failed_tiers:
-                                h = ft.get('hash')
-                                if h in master_hash_cache:
-                                    cap = master_hash_cache[h]['capacity']
-                                    mgross = master_hash_cache[h]['max_gross']
-                                    c_total += cap
-                                    if ft.get('status', '').lower() == 'soldout':
-                                        c_booked += cap
-                                        c_gross += mgross
-                                        if cap > 0: c_prices.add(mgross / cap)
-                                else:
-                                    all_cached = False
-                                    break
-                                    
-                            if all_cached:
-                                final_format = " / ".join(sorted(list(set(ft['format'] for ft in failed_tiers))))
-                                final_language = " / ".join(sorted(list(set(ft.get('language', DEFAULT_LANGUAGE) for ft in failed_tiers))))
-                                failed_urls = [f"https://www.fandango.com/napi/seatMap/{ft.get('hash', '')}" for ft in failed_tiers if ft.get('hash')]
-                                urls_str = " | ".join(failed_urls)
-                                price_str = " / ".join(sorted([f"${p:.2f}" for p in c_prices])) if c_prices else "$0.00"
-                                final_status = "Sold Out" if c_booked >= c_total and c_total > 0 else "Available"
+                            # If no base tier exists (only D-Box was returned), treat D-Box as the base
+                            if not base_failed:
+                                base_failed = dbox_failed
+                                dbox_failed = []
 
-                                local_shows_data.append({
-                                    'state': target_state, 't_id': t_id, 'theater': t_name, 
-                                    'format': final_format, 'language': final_language, 'time': show_time, 'status': final_status, 
-                                    'price_str': price_str, 'total': c_total, 
-                                    'booked': c_booked, 'gross': c_gross,
-                                    'seat_map_urls': urls_str
-                                })
+                            # 2. Pair each D-Box tier with a Base tier
+                            for base_ft in base_failed:
+                                paired_tiers = [base_ft]
+                                if dbox_failed:
+                                    paired_tiers.append(dbox_failed.pop(0))
                                 
-                                local_summary_data[t_id]['shows'] += 1
-                                local_summary_data[t_id]['total'] += c_total
-                                local_summary_data[t_id]['booked'] += c_booked
-                                local_summary_data[t_id]['gross'] += c_gross
+                                c_total = 0
+                                c_booked = 0
+                                c_gross = 0.0
+                                c_prices = set()
+                                all_cached = True
 
-                                print(f"   => 🟢 SELF-HEALED (All-Failed) via Hash Cache: {t_name} at {show_time} [{final_format}]")
-                                # ✨ NEW: Add to our new summary log
-                                local_hash_healed_log.append(f"( {target_state} ) {t_name} - {show_time} [{final_format}] - Healed {c_total} seats | ${c_gross:,.2f}")
-                                continue # Bypass standard S9/S10 failure logic!
+                                for pt in paired_tiers:
+                                    h = pt.get('hash')
+                                    if h in master_hash_cache:
+                                        cap = master_hash_cache[h]['capacity']
+                                        mgross = master_hash_cache[h]['max_gross']
+                                        c_total += cap
+                                        if pt.get('status', '').lower() == 'soldout':
+                                            c_booked += cap
+                                            c_gross += mgross
+                                            if cap > 0: c_prices.add(mgross / cap)
+                                    else:
+                                        all_cached = False
+                                        break
+                                
+                                if all_cached:
+                                    final_format = " / ".join(sorted(list(set(pt['format'] for pt in paired_tiers))))
+                                    final_language = " / ".join(sorted(list(set(pt.get('language', DEFAULT_LANGUAGE) for pt in paired_tiers))))
+                                    urls_str = " | ".join([f"https://www.fandango.com/napi/seatMap/{pt.get('hash', '')}" for pt in paired_tiers if pt.get('hash')])
+                                    price_str = " / ".join(sorted([f"${p:.2f}" for p in c_prices])) if c_prices else "$0.00"
+                                    final_status = "Sold Out" if c_booked >= c_total and c_total > 0 else "Available"
+
+                                    local_shows_data.append({
+                                        'state': target_state, 't_id': t_id, 'theater': t_name, 
+                                        'format': final_format, 'language': final_language, 'time': show_time, 'status': final_status, 
+                                        'price_str': price_str, 'total': c_total, 
+                                        'booked': c_booked, 'gross': c_gross,
+                                        'seat_map_urls': urls_str
+                                    })
+                                    
+                                    local_summary_data[t_id]['shows'] += 1
+                                    local_summary_data[t_id]['total'] += c_total
+                                    local_summary_data[t_id]['booked'] += c_booked
+                                    local_summary_data[t_id]['gross'] += c_gross
+
+                                    print(f"   => 🟢 SELF-HEALED (All-Failed) via Hash Cache: {t_name} at {show_time} [{final_format}]")
+                                    local_hash_healed_log.append(f"( {target_state} ) {t_name} - {show_time} [{final_format}] - Healed {c_total} seats | ${c_gross:,.2f}")
+                                else:
+                                    for pt in paired_tiers:
+                                        local_sold_out_queue.append({
+                                            'state': target_state, 't_id': t_id, 'theater': t_name, 
+                                            'format': pt['format'], 'language': pt.get('language', DEFAULT_LANGUAGE), 'time': show_time,
+                                            'seat_map_urls': f"https://www.fandango.com/napi/seatMap/{pt.get('hash', '')}"
+                                        })
+                            continue # Bypass standard S9/S10 failure logic!
                         
                         if has_generic_error:
                             # S10: Both APIs Fail + 'Available'
@@ -397,20 +422,13 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                             local_summary_data[t_id]['shows'] += 1
                             continue
                         else:
-                            # S9: Both APIs Fail + 'SoldOut'
-                            formats_seen = list(set(ft['format'] for ft in failed_tiers))
-                            final_format = " / ".join(sorted(formats_seen))
-                            languages_seen = list(set(ft.get('language', DEFAULT_LANGUAGE) for ft in failed_tiers))
-                            final_language = " / ".join(sorted(languages_seen)) if languages_seen else DEFAULT_LANGUAGE
-                            
-                            failed_urls = [f"https://www.fandango.com/napi/seatMap/{ft.get('hash', '')}" for ft in failed_tiers if ft.get('hash')]
-                            urls_str = " | ".join(failed_urls)
-                            
-                            local_sold_out_queue.append({
-                                'state': target_state, 't_id': t_id, 'theater': t_name, 
-                                'format': final_format, 'language': final_language, 'time': show_time,
-                                'seat_map_urls': urls_str
-                            })
+                            # S9: Both APIs Fail + 'SoldOut' (Fallback for any we didn't heal)
+                            for ft in failed_tiers:
+                                local_sold_out_queue.append({
+                                    'state': target_state, 't_id': t_id, 'theater': t_name, 
+                                    'format': ft['format'], 'language': ft.get('language', DEFAULT_LANGUAGE), 'time': show_time,
+                                    'seat_map_urls': f"https://www.fandango.com/napi/seatMap/{ft.get('hash', '')}"
+                                })
                             continue
 
                     # 🧠 PHYSICAL OVERLAP CLUSTERING
@@ -448,9 +466,17 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         if not matched:
                             clusters.append({'seat_ids': seat_ids, 'tiers': [vt], 'failed_tiers': []})
 
-                    # Assign failed tiers to the first physical cluster
-                    if failed_tiers and clusters:
-                        clusters[0]['failed_tiers'].extend(failed_tiers)
+                    # ✨ NEW: SMART FAILED TIER ROUTING (The True Fix)
+                    for ft in failed_tiers:
+                        # If it's a D-BOX tier, it's an overlay. Attach it to an existing physical screen.
+                        if "D-BOX" in ft['format'].upper() or "DBOX" in ft['format'].upper():
+                            if clusters:
+                                clusters[0]['failed_tiers'].append(ft)
+                            else:
+                                clusters.append({'seat_ids': set(), 'tiers': [], 'failed_tiers': [ft]})
+                        # If it's a Base tier, it represents its own physical room! Make a new cluster.
+                        else:
+                            clusters.append({'seat_ids': set(), 'tiers': [], 'failed_tiers': [ft]})
 
                     # 🎬 THE MASTER MATRIX (UNIFIED ALLOCATION ALGORITHM)
                     for c_idx, cluster in enumerate(clusters):
@@ -479,255 +505,289 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         is_multi_tier = (len(cluster['tiers']) + len(cluster['failed_tiers'])) > 1
 
                         # Sort valid tiers by cache capacity (descending) to find the base map
-                        cluster['tiers'].sort(
-                            key=lambda x: int(x['data'].get('areas', [{}])[0].get('totalSeatCount', 0)) if x.get('data', {}).get('areas') else 0, 
-                            reverse=True
-                        )
-                        base_vt = cluster['tiers'][0]
+                        # If there are no valid tiers (e.g., this is a standalone failed Base tier), skip valid logic
+                        base_vt = None
+                        if cluster['tiers']:
+                            cluster['tiers'].sort(
+                                key=lambda x: int(x['data'].get('areas', [{}])[0].get('totalSeatCount', 0)) if x.get('data', {}).get('areas') else 0, 
+                                reverse=True
+                            )
+                            base_vt = cluster['tiers'][0]
                         
                         safe_avg_price = AVG_PRICE
                         if PRICE_TAX_CUT and safe_avg_price > 0:
                             safe_avg_price = float((safe_avg_price // 5) * 5)
 
-                        def get_price(vt):
-                            try: 
-                                p = float(vt['data'].get('areas', [{}])[0].get('ticketInfo', [{}])[0].get('price', 0))
-                                if PRICE_TAX_CUT and p > 0: return float((p // 5) * 5)
-                                return p
-                            except: return 0.0
-
-                        base_price = get_price(base_vt)
-
-                        # Get total dots from base map to dynamically detect Under-Drawn maps
-                        base_seats = base_vt['data'].get('seats', [])
-                        base_phys_total_dots = sum(1 for s in base_seats if s.get('status', '').upper() in ['A', 'R'])
-                        base_has_valid_area = any(s.get('areaId') for s in base_seats)
-                        
-                        # Calculate known cache capacity for the cluster
-                        cluster_known_cache_cap = sum(sum(int(a.get('totalSeatCount', 0)) for a in vt['data'].get('areas', [])) for vt in cluster['tiers'])
-
-                        # Check if the map is "Under-Drawn" (Missing physical dots)
-                        is_underdrawn_map = cluster_known_cache_cap > base_phys_total_dots
-                        if is_underdrawn_map:
-                            print(f"{uid_log} ⚠️ UNDER-DRAWN MAP DETECTED: Cache Cap ({cluster_known_cache_cap}) > Phys Dots ({base_phys_total_dots}). Activating Cache Exception.")
-
-                        # --- 🌟 THE PHANTOM SEAT SUBTRACTOR (AREA-BY-AREA) 🌟 ---
-                        allocated_cap = 0
-                        allocated_booked = 0
-                        allocated_gross = 0.0
-                        
-                        for vt in cluster['tiers']:
-                            vt_seats = vt['data'].get('seats', [])
-                            aud_id = str(vt['data'].get('auditoriumId', 'Unknown'))
-                            dead_room_seats = aud_dead_room_blocks.get(aud_id, set())
-                            
-                            area_stats = {}
-                            for a in vt['data'].get('areas', []):
-                                a_id = str(a.get('id', ''))
+                        # --- If we have valid tiers, process them normally ---
+                        if base_vt:
+                            def get_price(vt):
                                 try: 
-                                    p = float(a.get('ticketInfo', [{}])[0].get('price', 0))
-                                    if PRICE_TAX_CUT and p > 0: p = float((p // 5) * 5)
-                                except: p = 0.0
-                                
-                                area_stats[a_id] = {
-                                    'cache_cap': int(a.get('totalSeatCount', 0)),
-                                    'cache_avail': int(a.get('availableSeatCount', 0)),
-                                    'price': p,
-                                    'phys_total': 0,
-                                    'raw_booked': 0,
-                                    'explicit_blocks': 0,
-                                    'front_row_blocks': 0,
-                                    'explicit_in_front_row': 0,
-                                    'dead_room_blocks': 0
-                                }
-                                
-                            if vt_seats:
-                                # Calculate occupancy to determine if front-row heuristic applies
-                                temp_phys_total = sum(1 for s in vt_seats if s.get('status', '').upper() in ['A', 'R'])
-                                temp_phys_booked = sum(1 for s in vt_seats if s.get('status', '').upper() == 'R')
-                                occupancy = (temp_phys_booked / temp_phys_total) if temp_phys_total > 0 else 0.0
-                                
-                                for s in vt_seats:
-                                    status = s.get('status', '').upper()
-                                    s_id = s.get('id', '')
-                                    row_num = s.get('row', -1)
-                                    a_id = str(s.get('areaId', ''))
-                                    
-                                    if a_id not in area_stats:
-                                        first_a_id = list(area_stats.keys())[0] if area_stats else 'UNKNOWN'
-                                        if first_a_id not in area_stats:
-                                            area_stats[first_a_id] = {'cache_cap': 0, 'cache_avail': 0, 'price': 0.0, 'phys_total': 0, 'raw_booked': 0, 'explicit_blocks': 0, 'front_row_blocks': 0, 'explicit_in_front_row': 0, 'dead_room_blocks': 0}
-                                        a_id = first_a_id
-                                        
-                                    ast = area_stats[a_id]
-                                    ast['phys_total'] += 1
-                                    
-                                    if status != 'A':
-                                        ast['raw_booked'] += 1
-                                        
-                                        is_explicit = (status != 'R')
-                                        is_front_row = (row_num == 1 or (row_num == -1 and str(s_id).upper().startswith('A')))
-                                        
-                                        if is_explicit:
-                                            ast['explicit_blocks'] += 1
-                                            
-                                        if is_front_row and occupancy < OCC_THRESHOLD_FRONTROW:
-                                            ast['front_row_blocks'] += 1
-                                            
-                                        if is_explicit and is_front_row and occupancy < OCC_THRESHOLD_FRONTROW:
-                                            ast['explicit_in_front_row'] += 1
-                                            
-                                        if s_id in dead_room_seats:
-                                            ast['dead_room_blocks'] += 1
-                            
-                            # --- FIX: Target Specific Screen Exclusion ---
-                            real_t_id = vt['data'].get('theaterId', t_id) 
-                            screen_id = f"{real_t_id}_{aud_id}"
-                            
-                            force_cached = screen_id in PREFER_CACHED_SCREENS
-                            force_physical = screen_id in PREFER_PHYSICAL_SCREENS
-                            
-                            vt_true_cap = 0
-                            vt_true_booked = 0
-                            vt_gross = 0.0
-                            vt_max_gross = 0.0 # ✨ NEW: Used for learning hash capacities
-                            vt_phys_total = 0
-                            vt_raw_booked = 0
-                            seats_to_remove = 0
-                            
-                            if (SEAT_COUNT_MODE == 1 and vt_seats and not force_cached) or force_physical:
-                                # STANDARD MODE: Trust physical dots minus the MAX() subtractor
-                                for a_id, ast in area_stats.items():
-                                    a_cache_cap = ast['cache_cap']
-                                    a_price = ast['price']
-                                    
-                                    a_phantom_math = max(0, ast['phys_total'] - a_cache_cap) if a_cache_cap > 0 else 0
-                                    a_visual_blocks = (ast['explicit_blocks'] + ast['front_row_blocks']) - ast['explicit_in_front_row']
-                                    a_seats_to_remove = max(a_phantom_math, a_visual_blocks, ast['dead_room_blocks'])
-                                    
-                                    a_true_cap = a_cache_cap
-                                    a_true_booked = max(0, ast['raw_booked'] - a_seats_to_remove)
-                                    
-                                    vt_phys_total += ast['phys_total']
-                                    vt_raw_booked += ast['raw_booked']
-                                    seats_to_remove += a_seats_to_remove
-                                    
-                                    vt_true_cap += a_true_cap
-                                    vt_true_booked += a_true_booked
-                                    vt_gross += (a_true_booked * a_price)
-                                    vt_max_gross += (a_true_cap * a_price) # ✨ NEW
-                                    if a_price > 0: prices_seen.add(a_price)
-                            else:
-                                # EXCEPTION MODE: Abandon dots (due to under-drawn maps) & strictly use Cache Math
-                                for a_id, ast in area_stats.items():
-                                    a_cache_cap = ast['cache_cap']
-                                    a_price = ast['price']
-                                    
-                                    a_true_cap = a_cache_cap
-                                    a_true_booked = max(0, a_cache_cap - ast['cache_avail'])
-                                    
-                                    vt_true_cap += a_true_cap
-                                    vt_true_booked += a_true_booked
-                                    vt_gross += (a_true_booked * a_price)
-                                    vt_max_gross += (a_true_cap * a_price) # ✨ NEW
-                                    if a_price > 0: prices_seen.add(a_price)
+                                    p = float(vt['data'].get('areas', [{}])[0].get('ticketInfo', [{}])[0].get('price', 0))
+                                    if PRICE_TAX_CUT and p > 0: return float((p // 5) * 5)
+                                    return p
+                                except: return 0.0
 
-                            # Master list override
-                            if vt['tier_info'].get('status', '').lower() == 'soldout':
+                            base_price = get_price(base_vt)
+
+                            # Get total dots from base map to dynamically detect Under-Drawn maps
+                            base_seats = base_vt['data'].get('seats', [])
+                            base_phys_total_dots = sum(1 for s in base_seats if s.get('status', '').upper() in ['A', 'R'])
+                            base_has_valid_area = any(s.get('areaId') for s in base_seats)
+                            
+                            # Calculate known cache capacity for the cluster
+                            cluster_known_cache_cap = sum(sum(int(a.get('totalSeatCount', 0)) for a in vt['data'].get('areas', [])) for vt in cluster['tiers'])
+
+                            # Check if the map is "Under-Drawn" (Missing physical dots)
+                            is_underdrawn_map = cluster_known_cache_cap > base_phys_total_dots
+                            if is_underdrawn_map:
+                                print(f"{uid_log} ⚠️ UNDER-DRAWN MAP DETECTED: Cache Cap ({cluster_known_cache_cap}) > Phys Dots ({base_phys_total_dots}). Activating Cache Exception.")
+
+                            # --- 🌟 THE PHANTOM SEAT SUBTRACTOR (AREA-BY-AREA) 🌟 ---
+                            allocated_cap = 0
+                            allocated_booked = 0
+                            allocated_gross = 0.0
+                            
+                            for vt in cluster['tiers']:
+                                vt_seats = vt['data'].get('seats', [])
+                                aud_id = str(vt['data'].get('auditoriumId', 'Unknown'))
+                                dead_room_seats = aud_dead_room_blocks.get(aud_id, set())
+                                
+                                area_stats = {}
+                                for a in vt['data'].get('areas', []):
+                                    a_id = str(a.get('id', ''))
+                                    try: 
+                                        p = float(a.get('ticketInfo', [{}])[0].get('price', 0))
+                                        if PRICE_TAX_CUT and p > 0: p = float((p // 5) * 5)
+                                    except: p = 0.0
+                                    
+                                    area_stats[a_id] = {
+                                        'cache_cap': int(a.get('totalSeatCount', 0)),
+                                        'cache_avail': int(a.get('availableSeatCount', 0)),
+                                        'price': p,
+                                        'phys_total': 0,
+                                        'raw_booked': 0,
+                                        'explicit_blocks': 0,
+                                        'front_row_blocks': 0,
+                                        'explicit_in_front_row': 0,
+                                        'dead_room_blocks': 0
+                                    }
+                                    
+                                if vt_seats:
+                                    # Calculate occupancy to determine if front-row heuristic applies
+                                    temp_phys_total = sum(1 for s in vt_seats if s.get('status', '').upper() in ['A', 'R'])
+                                    temp_phys_booked = sum(1 for s in vt_seats if s.get('status', '').upper() == 'R')
+                                    occupancy = (temp_phys_booked / temp_phys_total) if temp_phys_total > 0 else 0.0
+                                    
+                                    for s in vt_seats:
+                                        status = s.get('status', '').upper()
+                                        s_id = s.get('id', '')
+                                        row_num = s.get('row', -1)
+                                        a_id = str(s.get('areaId', ''))
+                                        
+                                        if a_id not in area_stats:
+                                            first_a_id = list(area_stats.keys())[0] if area_stats else 'UNKNOWN'
+                                            if first_a_id not in area_stats:
+                                                area_stats[first_a_id] = {'cache_cap': 0, 'cache_avail': 0, 'price': 0.0, 'phys_total': 0, 'raw_booked': 0, 'explicit_blocks': 0, 'front_row_blocks': 0, 'explicit_in_front_row': 0, 'dead_room_blocks': 0}
+                                            a_id = first_a_id
+                                            
+                                        ast = area_stats[a_id]
+                                        ast['phys_total'] += 1
+                                        
+                                        if status != 'A':
+                                            ast['raw_booked'] += 1
+                                            
+                                            is_explicit = (status != 'R')
+                                            is_front_row = (row_num == 1 or (row_num == -1 and str(s_id).upper().startswith('A')))
+                                            
+                                            if is_explicit:
+                                                ast['explicit_blocks'] += 1
+                                                
+                                            if is_front_row and occupancy < OCC_THRESHOLD_FRONTROW:
+                                                ast['front_row_blocks'] += 1
+                                                
+                                            if is_explicit and is_front_row and occupancy < OCC_THRESHOLD_FRONTROW:
+                                                ast['explicit_in_front_row'] += 1
+                                                
+                                            if s_id in dead_room_seats:
+                                                ast['dead_room_blocks'] += 1
+                                
+                                # --- FIX: Target Specific Screen Exclusion ---
+                                real_t_id = vt['data'].get('theaterId', t_id) 
+                                screen_id = f"{real_t_id}_{aud_id}"
+                                
+                                force_cached = screen_id in PREFER_CACHED_SCREENS
+                                force_physical = screen_id in PREFER_PHYSICAL_SCREENS
+                                
                                 vt_true_cap = 0
                                 vt_true_booked = 0
                                 vt_gross = 0.0
-                                vt_max_gross = 0.0
-                                for a_id, ast in area_stats.items():
-                                    vt_true_cap += ast['cache_cap']
-                                    vt_true_booked += ast['cache_cap']
-                                    vt_gross += (ast['cache_cap'] * ast['price'])
-                                    vt_max_gross += (ast['cache_cap'] * ast['price']) # ✨ NEW
+                                vt_max_gross = 0.0 # ✨ NEW: Used for learning capacities
+                                
+                                if (SEAT_COUNT_MODE == 1 and vt_seats and not force_cached) or force_physical:
+                                    # STANDARD MODE: Trust physical dots minus the MAX() subtractor
+                                    for a_id, ast in area_stats.items():
+                                        a_cache_cap = ast['cache_cap']
+                                        a_price = ast['price']
+                                        
+                                        a_phantom_math = max(0, ast['phys_total'] - a_cache_cap) if a_cache_cap > 0 else 0
+                                        a_visual_blocks = (ast['explicit_blocks'] + ast['front_row_blocks']) - ast['explicit_in_front_row']
+                                        a_seats_to_remove = max(a_phantom_math, a_visual_blocks, ast['dead_room_blocks'])
+                                        
+                                        a_true_cap = a_cache_cap
+                                        a_true_booked = max(0, ast['raw_booked'] - a_seats_to_remove)
+                                        
+                                        vt_true_cap += a_true_cap
+                                        vt_true_booked += a_true_booked
+                                        vt_gross += (a_true_booked * a_price)
+                                        vt_max_gross += (a_true_cap * a_price) # ✨ NEW
+                                        if a_price > 0: prices_seen.add(a_price)
+                                else:
+                                    # EXCEPTION MODE: Abandon dots (due to under-drawn maps) & strictly use Cache Math
+                                    for a_id, ast in area_stats.items():
+                                        a_cache_cap = ast['cache_cap']
+                                        a_price = ast['price']
+                                        
+                                        a_true_cap = a_cache_cap
+                                        a_true_booked = max(0, a_cache_cap - ast['cache_avail'])
+                                        
+                                        vt_true_cap += a_true_cap
+                                        vt_true_booked += a_true_booked
+                                        vt_gross += (a_true_booked * a_price)
+                                        vt_max_gross += (a_true_cap * a_price) # ✨ NEW
+                                        if a_price > 0: prices_seen.add(a_price)
 
-                            vt['true_capacity'] = vt_true_cap
-                            vt['true_booked'] = vt_true_booked
+                                # Master list override
+                                if vt['tier_info'].get('status', '').lower() == 'soldout':
+                                    vt_true_cap = 0
+                                    vt_true_booked = 0
+                                    vt_gross = 0.0
+                                    vt_max_gross = 0.0
+                                    for a_id, ast in area_stats.items():
+                                        vt_true_cap += ast['cache_cap']
+                                        vt_true_booked += ast['cache_cap']
+                                        vt_gross += (ast['cache_cap'] * ast['price'])
+                                        vt_max_gross += (ast['cache_cap'] * ast['price']) # ✨ NEW
+
+                                vt['true_capacity'] = vt_true_cap
+                                vt['true_booked'] = vt_true_booked
+                                
+                                allocated_cap += vt_true_cap
+                                allocated_booked += vt_true_booked
+                                allocated_gross += vt_gross
+
+                                # ✨ HASH CACHE LEARNING PHASE ✨
+                                tier_hash = vt['tier_info'].get('hash')
+                                if tier_hash and vt_true_cap > 0:
+                                    local_hash_cache[tier_hash] = {
+                                        'capacity': vt_true_cap,
+                                        'max_gross': vt_max_gross,
+                                        'format': vt['tier_info'].get('format', 'Standard')
+                                    }
+
+                            # --- Assess Global Statuses ---
+                            all_tiers_info = [vt['tier_info'] for vt in cluster['tiers']] + cluster['failed_tiers']
+                            is_any_available = any(t.get('status', '').lower() != 'soldout' for t in all_tiers_info)
+                            has_failed_tiers = len(cluster['failed_tiers']) > 0
+                            has_available_failed_tiers = any(
+                                ft.get('status', '').lower() != 'soldout'
+                                for ft in cluster['failed_tiers']
+                            )
+
+                            # --- 🎬 MATRIX LOGIC ---
+                            base_aud_id = base_vt['data'].get('auditoriumId', 'Unknown')
+                            real_base_t_id = base_vt['data'].get('theaterId', t_id) # Pulls exact Fandango ID
+                            base_screen_id = f"{real_base_t_id}_{base_aud_id}"
+                            is_forced_cached = base_screen_id in PREFER_CACHED_SCREENS
                             
-                            allocated_cap += vt_true_cap
-                            allocated_booked += vt_true_booked
-                            allocated_gross += vt_gross
-
-                            # ✨ HASH CACHE LEARNING PHASE ✨
-                            tier_hash = vt['tier_info'].get('hash')
-                            if tier_hash and vt_true_cap > 0:
-                                local_hash_cache[tier_hash] = {
-                                    'capacity': vt_true_cap,
-                                    'max_gross': vt_max_gross,
-                                    'format': vt['tier_info'].get('format', 'Standard')
-                                }
-
-                        # --- Assess Global Statuses ---
-                        all_tiers_info = [vt['tier_info'] for vt in cluster['tiers']] + cluster['failed_tiers']
-                        is_any_available = any(t.get('status', '').lower() != 'soldout' for t in all_tiers_info)
-                        has_failed_tiers = len(cluster['failed_tiers']) > 0
-                        has_available_failed_tiers = any(
-                            ft.get('status', '').lower() != 'soldout'
-                            for ft in cluster['failed_tiers']
-                        )
-
-                        # --- 🎬 MATRIX LOGIC ---
-                        base_aud_id = base_vt['data'].get('auditoriumId', 'Unknown')
-                        real_base_t_id = base_vt['data'].get('theaterId', t_id) # Pulls exact Fandango ID
-                        base_screen_id = f"{real_base_t_id}_{base_aud_id}"
-                        is_forced_cached = base_screen_id in PREFER_CACHED_SCREENS
-                        
-                        if not is_multi_tier and SEAT_COUNT_MODE == 1 and base_seats and base_has_valid_area and not is_forced_cached:
-                            combined_total = allocated_cap
-                            combined_booked = allocated_booked
-                            combined_gross = allocated_gross
-                            calc_method_log = "Physical Catch-All"
-                        else:
-                            
-                            if not has_failed_tiers:
-                                # GROUP 1: ALL APIs WORK
+                            if not is_multi_tier and SEAT_COUNT_MODE == 1 and base_seats and base_has_valid_area and not is_forced_cached:
                                 combined_total = allocated_cap
                                 combined_booked = allocated_booked
                                 combined_gross = allocated_gross
-                                calc_method_log = "Per-Tier Phantom Sync"
+                                calc_method_log = "Physical Catch-All"
                             else:
-                                # WE HAVE FAILED TIERS
-                                missing_capacity = max(0, base_phys_total_dots - allocated_cap)
                                 
-                                combined_total = allocated_cap
-                                combined_booked = allocated_booked
-                                combined_gross = allocated_gross
+                                if not has_failed_tiers:
+                                    # GROUP 1: ALL APIs WORK
+                                    combined_total = allocated_cap
+                                    combined_booked = allocated_booked
+                                    combined_gross = allocated_gross
+                                    calc_method_log = "Per-Tier Phantom Sync"
+                                else:
+                                    # WE HAVE FAILED TIERS
+                                    missing_capacity = max(0, base_phys_total_dots - allocated_cap)
+                                    
+                                    combined_total = allocated_cap
+                                    combined_booked = allocated_booked
+                                    combined_gross = allocated_gross
+                                    
+                                    # 🚨 THE FIX: Check specifically if the crashed tiers are Sold Out or Available
+                                    failed_tiers_soldout = all(ft.get('status', '').lower() == 'soldout' for ft in cluster['failed_tiers'])
+                                    
+                                    # ✨ HASH CACHE INJECTION (Matrix Level) ✨
+                                    for ft in cluster['failed_tiers']:
+                                        tier_hash = ft.get('hash')
+                                        is_soldout = ft.get('status', '').lower() == 'soldout'
+
+                                        if tier_hash in master_hash_cache:
+                                            c_cap = master_hash_cache[tier_hash]['capacity']
+                                            c_gross = master_hash_cache[tier_hash]['max_gross']
+
+                                            combined_total += c_cap
+                                            if is_soldout:
+                                                combined_booked += c_cap
+                                                combined_gross += c_gross
+                                                if c_cap > 0: prices_seen.add(c_gross / c_cap)
+                                                
+                                            missing_capacity = max(0, missing_capacity - c_cap)
+                                            calc_method_log = "Matrix: Hash Healed"
+                                        else:
+                                            # Use old fallback logic for THIS tier
+                                            combined_total += missing_capacity
+                                            if is_soldout:
+                                                missing_booked = missing_capacity
+                                                combined_booked += missing_booked
+                                                price_to_use = safe_avg_price if not is_any_available else MAX_TIER_PRICE
+                                                combined_gross += (missing_booked * price_to_use)
+                                                if price_to_use > 0: prices_seen.add(price_to_use)
+                                            missing_capacity = 0 # Consumed so next failed tier gets 0 if it's not in cache
+                                            calc_method_log = "Matrix: Math Fallback"
+                        else:
+                            # --- We have NO valid tiers in this cluster (Standalone Failed Base Tier) ---
+                            combined_total = 0
+                            combined_booked = 0
+                            combined_gross = 0.0
+                            calc_method_log = ""
+                            has_available_failed_tiers = False
+                            
+                            for ft in cluster['failed_tiers']:
+                                h = ft.get('hash')
+                                is_soldout = ft.get('status', '').lower() == 'soldout'
+                                if not is_soldout: has_available_failed_tiers = True
                                 
-                                # 🚨 THE FIX: Check specifically if the crashed tiers are Sold Out or Available
-                                failed_tiers_soldout = all(ft.get('status', '').lower() == 'soldout' for ft in cluster['failed_tiers'])
-                                
-                                # ✨ HASH CACHE INJECTION (Matrix Level) ✨
-                                for ft in cluster['failed_tiers']:
-                                    tier_hash = ft.get('hash')
-                                    is_soldout = ft.get('status', '').lower() == 'soldout'
+                                if h in master_hash_cache:
+                                    c_cap = master_hash_cache[h]['capacity']
+                                    c_gross = master_hash_cache[h]['max_gross']
+                                    combined_total += c_cap
+                                    if is_soldout:
+                                        combined_booked += c_cap
+                                        combined_gross += c_gross
+                                        if c_cap > 0: prices_seen.add(c_gross / c_cap)
+                                    calc_method_log = "Standalone: Hash Healed"
+                                else:
+                                    if is_soldout:
+                                        # Un-healable sold out standalone tier, send to Sold Out Queue
+                                        local_sold_out_queue.append({
+                                            'state': target_state, 't_id': t_id, 'theater': t_name, 
+                                            'format': ft['format'], 'language': ft.get('language', DEFAULT_LANGUAGE), 'time': show_time,
+                                            'seat_map_urls': f"https://www.fandango.com/napi/seatMap/{h}"
+                                        })
+                                    calc_method_log = "Standalone: Queue or Ignore"
 
-                                    if tier_hash in master_hash_cache:
-                                        c_cap = master_hash_cache[tier_hash]['capacity']
-                                        c_gross = master_hash_cache[tier_hash]['max_gross']
+                            # If nothing was healed and it went to queue/ignore, skip generating an empty row
+                            if combined_total == 0:
+                                continue
 
-                                        combined_total += c_cap
-                                        if is_soldout:
-                                            combined_booked += c_cap
-                                            combined_gross += c_gross
-                                            if c_cap > 0: prices_seen.add(c_gross / c_cap)
-                                            
-                                        missing_capacity = max(0, missing_capacity - c_cap)
-                                        calc_method_log = "Matrix: Hash Healed"
-                                    else:
-                                        # Use old fallback logic for THIS tier
-                                        combined_total += missing_capacity
-                                        if is_soldout:
-                                            missing_booked = missing_capacity
-                                            combined_booked += missing_booked
-                                            price_to_use = safe_avg_price if not is_any_available else MAX_TIER_PRICE
-                                            combined_gross += (missing_booked * price_to_use)
-                                            if price_to_use > 0: prices_seen.add(price_to_use)
-                                        missing_capacity = 0 # Consumed so next failed tier gets 0 if it's not in cache
-                                        calc_method_log = "Matrix: Math Fallback"
-
+                        # Ensure valid dictionary structure and final status for output
                         if combined_total > 0:
                             kb_key = f"{t_id}_{final_format}"
                             if kb_key not in local_knowledge_base:
@@ -1021,7 +1081,7 @@ if __name__ == "__main__":
     # ── 4. SOLD-OUT QUEUE (MANUAL REVIEW) ───────────────────────────────────
     # =========================================================================
     if master_sold_out_queue:
-        print(f"\n� Processing {len(master_sold_out_queue)} Total Sold Out shows from Queue...")
+        print(f"\n Processing {len(master_sold_out_queue)} Total Sold Out shows from Queue...")
         
         for item in master_sold_out_queue:
             t_id = item['t_id']
