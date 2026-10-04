@@ -246,7 +246,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         
                         # ✨ FIX: Intercept explicit PerformanceSoldOut list responses
                         if isinstance(seat_response, list) and len(seat_response) > 0 and seat_response[0].get("id") == "PerformanceSoldOut":
-                            tier['status'] = 'Sold Out'
+                            tier['status'] = 'soldout' # <--- Removed the space here!
                             show_info['failed_tiers'].append(tier)
                         elif seat_response and isinstance(seat_response, dict) and "error" not in seat_response:
                             show_info['valid_tiers'].append({'data': seat_response.get('data', seat_response), 'tier_info': tier})
@@ -503,6 +503,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         uid_log = f"[{t_id} | {show_time} | {final_format}]"
                         
                         is_multi_tier = (len(cluster['tiers']) + len(cluster['failed_tiers'])) > 1
+                        healed_tiers_info = [] # ✨ NEW: Tracks specific tiers healed for accurate logging
 
                         # Sort valid tiers by cache capacity (descending) to find the base map
                         # If there are no valid tiers (e.g., this is a standalone failed Base tier), skip valid logic
@@ -740,6 +741,8 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                                 
                                             missing_capacity = max(0, missing_capacity - c_cap)
                                             calc_method_log = "Matrix: Hash Healed"
+                                            # ✨ NEW: Log specifically what tier was partially healed
+                                            healed_tiers_info.append(f"[{ft['format']}] {c_cap} seats | ${c_gross:,.2f}")
                                         else:
                                             # Use old fallback logic for THIS tier
                                             combined_total += missing_capacity
@@ -809,9 +812,13 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                             f"Gross: ${combined_gross:<7.2f} [{calc_method_log}]"
                         )
 
-                        # ✨ NEW: If the matrix used the hash cache, add it to the summary log
+                        # ✨ NEW: Accurate Logging separation for Partial vs Full Heals
                         if "Hash Healed" in calc_method_log:
-                            local_hash_healed_log.append(f"( {target_state} ) {t_name} - {show_time} [{final_format}] - Healed {combined_total} seats | ${combined_gross:,.2f}")
+                            if "Matrix" in calc_method_log and healed_tiers_info:
+                                partial_details = " + ".join(healed_tiers_info)
+                                local_hash_healed_log.append(f"( {target_state} ) {t_name} - {show_time} - 🩹 PARTIAL HEAL: {partial_details} (Merged into live room)")
+                            else:
+                                local_hash_healed_log.append(f"( {target_state} ) {t_name} - {show_time} [{final_format}] - Healed {combined_total} seats | ${combined_gross:,.2f}")
                         
                         local_shows_data.append({
                             'state': target_state, 't_id': t_id, 'theater': t_name, 
