@@ -239,8 +239,14 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         seat_response = page.evaluate(f"""async () => {{
                             try {{
                                 const response = await fetch('{seat_api_url}');
-                                if (!response.ok) return {{ error: response.status }};
-                                return await response.json();
+                                const data = await response.json().catch(() => null);
+                                if (!response.ok) {{
+                                    if (Array.isArray(data) && data.length > 0 && data[0].id === 'PerformanceSoldOut') {{
+                                        return data;
+                                    }}
+                                    return {{ error: response.status }};
+                                }}
+                                return data;
                             }} catch(e) {{ return {{ error: "Fetch Exception: " + e.message }}; }}
                         }}""")
                         
@@ -357,6 +363,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                     if h in master_hash_cache:
                                         cap = master_hash_cache[h]['capacity']
                                         mgross = master_hash_cache[h]['max_gross']
+                                        if mgross == 0 and cap > 0: mgross = cap * MAX_TIER_PRICE # ✨ Price Failsafe
                                         c_total += cap
                                         if pt.get('status', '').lower() == 'soldout':
                                             c_booked += cap
@@ -732,6 +739,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                         if tier_hash in master_hash_cache:
                                             c_cap = master_hash_cache[tier_hash]['capacity']
                                             c_gross = master_hash_cache[tier_hash]['max_gross']
+                                            if c_gross == 0 and c_cap > 0: c_gross = c_cap * MAX_TIER_PRICE # ✨ Price Failsafe
 
                                             combined_total += c_cap
                                             if is_soldout:
@@ -770,6 +778,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                 if h in master_hash_cache:
                                     c_cap = master_hash_cache[h]['capacity']
                                     c_gross = master_hash_cache[h]['max_gross']
+                                    if c_gross == 0 and c_cap > 0: c_gross = c_cap * MAX_TIER_PRICE # ✨ Price Failsafe
                                     combined_total += c_cap
                                     if is_soldout:
                                         combined_booked += c_cap
