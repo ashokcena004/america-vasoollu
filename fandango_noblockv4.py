@@ -1,5 +1,4 @@
-# If D-BOX shows are not merging properly with base show. Try removing more amenities like luxury seating etc... so shows can match. line 199.
-# Currently assuming only D-BOX will have its separate tier. If finding exaggerated shows count, try chexking Premium shows if some other formats also having separate tiers
+# D-BOX has a separate showtime hash but shares the physical auditorium with its base show.
 
 import time
 from datetime import datetime, timezone, timedelta
@@ -178,6 +177,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         # 1. Get all amenities as clean uppercase strings
                         raw_amenities = [am.get('name', '').strip() for am in amenity.get('amenities', []) if am.get('name')]
                         raw_amenities_upper = [a.upper() for a in raw_amenities]
+                        is_dbox = any("D-BOX" in a or "DBOX" in a for a in raw_amenities_upper)
                         
                         # 2. EXTRACT FORMAT SCANNER ONLY FOR REPORTS (Restores precise casing)
                         show_format = base_format
@@ -220,7 +220,8 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                 'hash': show_hash, 
                                 'status': status, 
                                 'format': show_format, 
-                                'language': show_language 
+                                'language': show_language,
+                                'is_dbox': is_dbox
                             })
             
             except Exception as e:
@@ -338,8 +339,8 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         # ✨ HASH CACHE SELF-HEALING (All Tiers Failed)
                         if len(failed_tiers) > 0 and not has_generic_error:
                             # 1. Separate Base tiers from D-Box overlay tiers
-                            base_failed = [ft for ft in failed_tiers if "D-BOX" not in ft['format'].upper() and "DBOX" not in ft['format'].upper()]
-                            dbox_failed = [ft for ft in failed_tiers if "D-BOX" in ft['format'].upper() or "DBOX" in ft['format'].upper()]
+                            base_failed = [ft for ft in failed_tiers if not ft.get('is_dbox', False)]
+                            dbox_failed = [ft for ft in failed_tiers if ft.get('is_dbox', False)]
                             
                             # If no base tier exists (only D-Box was returned), treat D-Box as the base
                             if not base_failed:
@@ -476,7 +477,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                     # ✨ NEW: SMART FAILED TIER ROUTING (The True Fix)
                     for ft in failed_tiers:
                         # If it's a D-BOX tier, it's an overlay. Attach it to an existing physical screen.
-                        if "D-BOX" in ft['format'].upper() or "DBOX" in ft['format'].upper():
+                        if ft.get('is_dbox', False):
                             if clusters:
                                 clusters[0]['failed_tiers'].append(ft)
                             else:
