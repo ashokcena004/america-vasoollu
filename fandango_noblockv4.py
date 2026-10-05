@@ -476,15 +476,23 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
 
                     # ✨ NEW: SMART FAILED TIER ROUTING (The True Fix)
                     for ft in failed_tiers:
-                        # If it's a D-BOX tier, it's an overlay. Attach it to an existing physical screen.
-                        if "D-BOX" in ft['format'].upper() or "DBOX" in ft['format'].upper():
+                        is_dbox_failed = "D-BOX" in ft['format'].upper() or "DBOX" in ft['format'].upper()
+                        
+                        # D-BOX overlay crashed: attach to the live physical base room if it exists
+                        if is_dbox_failed:
                             if clusters:
                                 clusters[0]['failed_tiers'].append(ft)
                             else:
                                 clusters.append({'seat_ids': set(), 'tiers': [], 'failed_tiers': [ft]})
-                        # If it's a Base tier, it represents its own physical room! Make a new cluster.
+                                
+                        # BASE room crashed: create a new room, UNLESS it needs to rescue an orphaned live D-Box map
                         else:
-                            clusters.append({'seat_ids': set(), 'tiers': [], 'failed_tiers': [ft]})
+                            has_live_dbox_host = clusters and any("D-BOX" in vt['tier_info']['format'].upper() or "DBOX" in vt['tier_info']['format'].upper() for vt in clusters[0]['tiers'])
+                            
+                            if has_live_dbox_host:
+                                clusters[0]['failed_tiers'].append(ft) # Dock the crashed Base into the live D-Box cluster
+                            else:
+                                clusters.append({'seat_ids': set(), 'tiers': [], 'failed_tiers': [ft]})
 
                     # 🎬 THE MASTER MATRIX (UNIFIED ALLOCATION ALGORITHM)
                     for c_idx, cluster in enumerate(clusters):
@@ -863,31 +871,47 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
 def generate_run_reports(master_shows_data, previous_shows_data, last_updated_str):
     os.makedirs("reports", exist_ok=True)
 
+    def prepare_report_rows(rows):
+        report_rows = []
+        for row in rows:
+            report_row = dict(row)
+            show_format = str(report_row.get('format', '')).strip()
+            compact_format = re.sub(r"[^A-Z0-9]", "", show_format.upper())
+            has_xd = "CINEMARKXD" in compact_format or re.search(
+                r"(?<![A-Z0-9])XD(?![A-Z0-9])", show_format.upper()
+            )
+            if has_xd:
+                report_row['format'] = "Cinemark XD"
+            report_rows.append(report_row)
+        return report_rows
+
+    report_shows_data = prepare_report_rows(master_shows_data)
+    report_previous_shows_data = prepare_report_rows(previous_shows_data)
     base_filename = os.path.join("reports", f"{MOVIE_SLUG}_{SHOW_DATE}")
 
     excel_path = export_master_excel(
-        master_shows_data,
+        report_shows_data,
         base_filename,
-        previous_shows_data=previous_shows_data,
+        previous_shows_data=report_previous_shows_data,
         last_updated_str=last_updated_str
     )
 
     html_path = generate_fandango_html_report(
-        master_shows_data,
+        report_shows_data,
         f"{base_filename}.html",
         movie_name=MOVIE_TITLE,
         show_date=SHOW_DATE,
-        previous_shows_data=previous_shows_data,
+        previous_shows_data=report_previous_shows_data,
         last_updated_str=last_updated_str,
         country_name=""
     )
 
     image_path = generate_fandango_image_report(
-        master_shows_data,
+        report_shows_data,
         f"{base_filename}.png",
         movie_name=MOVIE_TITLE,
         show_date=SHOW_DATE,
-        previous_shows_data=previous_shows_data,
+        previous_shows_data=report_previous_shows_data,
         last_updated_str=last_updated_str,
         country_name=""
     )
