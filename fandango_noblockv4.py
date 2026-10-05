@@ -868,50 +868,45 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
     }
 
 
+def normalize_xd_format_rows(rows):
+    for row in rows:
+        show_format = str(row.get('format', '')).strip()
+        compact_format = re.sub(r"[^A-Z0-9]", "", show_format.upper())
+        has_xd = "CINEMARKXD" in compact_format or re.search(
+            r"(?<![A-Z0-9])XD(?![A-Z0-9])", show_format.upper()
+        )
+        if has_xd:
+            row['format'] = "Cinemark XD"
+
+
 def generate_run_reports(master_shows_data, previous_shows_data, last_updated_str):
     os.makedirs("reports", exist_ok=True)
 
-    def prepare_report_rows(rows):
-        report_rows = []
-        for row in rows:
-            report_row = dict(row)
-            show_format = str(report_row.get('format', '')).strip()
-            compact_format = re.sub(r"[^A-Z0-9]", "", show_format.upper())
-            has_xd = "CINEMARKXD" in compact_format or re.search(
-                r"(?<![A-Z0-9])XD(?![A-Z0-9])", show_format.upper()
-            )
-            if has_xd:
-                report_row['format'] = "Cinemark XD"
-            report_rows.append(report_row)
-        return report_rows
-
-    report_shows_data = prepare_report_rows(master_shows_data)
-    report_previous_shows_data = prepare_report_rows(previous_shows_data)
     base_filename = os.path.join("reports", f"{MOVIE_SLUG}_{SHOW_DATE}")
 
     excel_path = export_master_excel(
-        report_shows_data,
+        master_shows_data,
         base_filename,
-        previous_shows_data=report_previous_shows_data,
+        previous_shows_data=previous_shows_data,
         last_updated_str=last_updated_str
     )
 
     html_path = generate_fandango_html_report(
-        report_shows_data,
+        master_shows_data,
         f"{base_filename}.html",
         movie_name=MOVIE_TITLE,
         show_date=SHOW_DATE,
-        previous_shows_data=report_previous_shows_data,
+        previous_shows_data=previous_shows_data,
         last_updated_str=last_updated_str,
         country_name=""
     )
 
     image_path = generate_fandango_image_report(
-        report_shows_data,
+        master_shows_data,
         f"{base_filename}.png",
         movie_name=MOVIE_TITLE,
         show_date=SHOW_DATE,
-        previous_shows_data=report_previous_shows_data,
+        previous_shows_data=previous_shows_data,
         last_updated_str=last_updated_str,
         country_name=""
     )
@@ -1456,6 +1451,10 @@ if __name__ == "__main__":
     # =========================================================================
     # ── 4.9 SAVE REPORT ARTIFACTS (GitHub Actions Downloadable, Not Committed) ─
     # =========================================================================
+    normalize_xd_format_rows(master_shows_data)
+    normalize_xd_format_rows(previous_shows_data)
+    normalize_xd_format_rows(recent_shows_data)
+
     generated_reports = {}
     if master_shows_data:
         try:
