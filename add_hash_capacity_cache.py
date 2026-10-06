@@ -1,4 +1,4 @@
-"""Add or update one Fandango tier entry in Firebase's hash capacity cache."""
+"""Add or update multiple Fandango tier entries in Firebase's hash capacity cache."""
 
 from datetime import datetime
 import json
@@ -13,10 +13,10 @@ from firebase_admin import credentials, db
 # Set these values before running the script.
 MOVIE_SLUG = ""
 SHOW_DATE = ""
-HASH_ID = ""
-CAPACITY = None
-SHOW_FORMAT = ""
-MAX_GROSS = None
+HASH_CACHE_ENTRIES = [
+    # Add one dictionary per show/tier:
+    # {"hash_id": "v2-...", "capacity": 198, "format": "Cinemark XD", "max_gross": 6326.10},
+]
 
 
 def validate_database_key(value: str, name: str) -> str:
@@ -36,24 +36,42 @@ def validate_show_date(value: str) -> str:
     return value
 
 
-def add_hash_cache_entry(
+def add_hash_cache_entries(
     movie_slug: str,
     show_date: str,
-    hash_id: str,
-    capacity: int,
-    show_format: str,
-    max_gross: float,
-) -> str:
+) -> tuple[str, int]:
     movie_slug = validate_database_key(movie_slug, "movie-slug")
     show_date = validate_show_date(show_date)
-    hash_id = validate_database_key(hash_id, "hash-id")
 
-    if capacity < 0:
-        raise ValueError("capacity must be zero or greater.")
-    if not show_format.strip():
-        raise ValueError("format must not be empty.")
-    if not math.isfinite(max_gross) or max_gross < 0:
-        raise ValueError("max-gross must be a finite number that is zero or greater.")
+    if not HASH_CACHE_ENTRIES:
+        raise ValueError("Add at least one entry to HASH_CACHE_ENTRIES.")
+
+    cache_entries = {}
+    for index, entry in enumerate(HASH_CACHE_ENTRIES, start=1):
+        if not isinstance(entry, dict):
+            raise ValueError(f"HASH_CACHE_ENTRIES item {index} must be a dictionary.")
+
+        hash_id = validate_database_key(entry.get("hash_id", ""), f"item {index} hash-id")
+        capacity = entry.get("capacity")
+        show_format = entry.get("format")
+        max_gross = entry.get("max_gross")
+
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 0:
+            raise ValueError(f"Item {index} capacity must be a whole number that is zero or greater.")
+        if not isinstance(show_format, str) or not show_format.strip():
+            raise ValueError(f"Item {index} format must not be empty.")
+        if isinstance(max_gross, bool) or not isinstance(max_gross, (int, float)):
+            raise ValueError(f"Item {index} max_gross must be a number.")
+        if not math.isfinite(max_gross) or max_gross < 0:
+            raise ValueError(f"Item {index} max_gross must be finite and zero or greater.")
+        if hash_id in cache_entries:
+            raise ValueError(f"Duplicate hash_id in HASH_CACHE_ENTRIES: {hash_id}")
+
+        cache_entries[hash_id] = {
+            "capacity": capacity,
+            "format": show_format.strip(),
+            "max_gross": float(max_gross),
+        }
 
     firebase_creds_json = os.environ.get("FIREBASE_CREDENTIALS")
     firebase_db_url = os.environ.get("FIREBASE_DATABASE_URL")
@@ -69,33 +87,20 @@ def add_hash_cache_entry(
         firebase_admin.initialize_app(credential, {"databaseURL": firebase_db_url})
 
     cache_path = f"markets/usa/movies/{movie_slug}/{show_date}/hash_capacity_cache"
-    cache_entry = {
-        "capacity": capacity,
-        "format": show_format.strip(),
-        "max_gross": max_gross,
-    }
-    db.reference(cache_path).child(hash_id).update(cache_entry)
-    return f"{cache_path}/{hash_id}"
+    db.reference(cache_path).update(cache_entries)
+    return cache_path, len(cache_entries)
 
 
 def main() -> None:
-    if not MOVIE_SLUG or not SHOW_DATE or not HASH_ID or not SHOW_FORMAT:
-        raise ValueError("Set MOVIE_SLUG, SHOW_DATE, HASH_ID, and SHOW_FORMAT at the top of the script.")
-    if isinstance(CAPACITY, bool) or not isinstance(CAPACITY, int):
-        raise ValueError("Set CAPACITY to a whole number at the top of the script.")
-    if isinstance(MAX_GROSS, bool) or not isinstance(MAX_GROSS, (int, float)):
-        raise ValueError("Set MAX_GROSS to a number at the top of the script.")
+    if not MOVIE_SLUG or not SHOW_DATE:
+        raise ValueError("Set MOVIE_SLUG and SHOW_DATE at the top of the script.")
 
     load_dotenv(Path(__file__).resolve().parent / ".env")
-    cache_path = add_hash_cache_entry(
+    cache_path, entry_count = add_hash_cache_entries(
         movie_slug=MOVIE_SLUG,
         show_date=SHOW_DATE,
-        hash_id=HASH_ID,
-        capacity=CAPACITY,
-        show_format=SHOW_FORMAT,
-        max_gross=float(MAX_GROSS),
     )
-    print(f"Hash capacity cache updated at: {cache_path}")
+    print(f"Updated {entry_count} hash cache entr{'y' if entry_count == 1 else 'ies'} at: {cache_path}")
 
 
 if __name__ == "__main__":

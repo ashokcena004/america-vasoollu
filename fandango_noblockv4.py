@@ -49,7 +49,7 @@ MANUAL_SHOWS = [
     #["New Jersey", "AAEMI", "6:20 PM", 3125.0, 3125.0, 125, 125, 1.0, "Manual", "Telugu"],
     #["New Jersey", "AAEMI", "6:35 PM", 3125.0, 3125.0, 125, 125, 1.0, "Manual", "Telugu"],
     # ["EXTRA", "", "", 4000.0, 0, 160]
-    ["EXTRA", "", "", 16500.0, 0, 560] # Cinelounge Fremont Fans Show
+    # ["EXTRA", "", "", 16500.0, 0, 560] # Cinelounge Fremont Fans Show
 ]
 
 EXTRA_GROSS_NOTE = "Added extra gross for offline fans sold-out shows - Cinelounge Fremont 7 CA."
