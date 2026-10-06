@@ -178,15 +178,15 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         # 1. Get all amenities as clean uppercase strings
                         raw_amenities = [am.get('name', '').strip() for am in amenity.get('amenities', []) if am.get('name')]
                         raw_amenities_upper = [a.upper() for a in raw_amenities]
+                        is_dbox = any("D-BOX" in a or "DBOX" in a for a in raw_amenities_upper)
                         
                         # 2. EXTRACT FORMAT SCANNER ONLY FOR REPORTS (Restores precise casing)
-                        premium_keywords = ["XD", "IMAX", "3D", "AMC", "4DX", "RPX", "D-BOX"]
-                        found_premiums = []
+                        show_format = base_format
+                        premium_keywords = ["XD", "IMAX", "3D", "DOLBY", "SCREENX", "4DX", "RPX", "PRIME", "BIGD", "XPLUS", "D-BOX", "70MM", "SONY", "DFX", "LASER", "ATMOS"]
                         for am_name, am_up in zip(raw_amenities, raw_amenities_upper):
-                            if any(k in am_up for k in premium_keywords):
-                                found_premiums.append(am_name)
-                        
-                        show_format = " / ".join(found_premiums) if found_premiums else base_format
+                            if any(k in am_up for k in premium_keywords) and show_format == base_format:
+                                show_format = am_name
+                                break
                         
                         # 3. Extract Language purely for your Excel reports
                         show_language = DEFAULT_LANGUAGE
@@ -221,7 +221,8 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                 'hash': show_hash, 
                                 'status': status, 
                                 'format': show_format, 
-                                'language': show_language 
+                                'language': show_language,
+                                'is_dbox': is_dbox
                             })
             
             except Exception as e:
@@ -339,8 +340,8 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         # ✨ HASH CACHE SELF-HEALING (All Tiers Failed)
                         if len(failed_tiers) > 0 and not has_generic_error:
                             # 1. Separate Base tiers from D-Box overlay tiers
-                            base_failed = [ft for ft in failed_tiers if "D-BOX" not in ft['format'].upper() and "DBOX" not in ft['format'].upper()]
-                            dbox_failed = [ft for ft in failed_tiers if "D-BOX" in ft['format'].upper() or "DBOX" in ft['format'].upper()]
+                            base_failed = [ft for ft in failed_tiers if not ft.get('is_dbox', False)]
+                            dbox_failed = [ft for ft in failed_tiers if ft.get('is_dbox', False)]
                             
                             # If no base tier exists (only D-Box was returned), treat D-Box as the base
                             if not base_failed:
@@ -474,27 +475,39 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         if not matched:
                             clusters.append({'seat_ids': seat_ids, 'tiers': [vt], 'failed_tiers': []})
 
-                    # ✨ NEW: SMART FAILED TIER ROUTING (The True Fix)
-                    for ft in failed_tiers:
-                        is_dbox_failed = "D-BOX" in ft['format'].upper() or "DBOX" in ft['format'].upper()
-                        
-                        # D-BOX overlay crashed: attach to the live physical base room if it exists
-                        if is_dbox_failed:
-                            if clusters:
-                                clusters[0]['failed_tiers'].append(ft)
-                            else:
-                                clusters.append({'seat_ids': set(), 'tiers': [], 'failed_tiers': [ft]})
-                                
-                        # BASE room crashed: create a new room, UNLESS it needs to rescue an orphaned live D-Box map
-                        else:
-                            has_live_dbox_host = clusters and any("D-BOX" in vt['tier_info']['format'].upper() or "DBOX" in vt['tier_info']['format'].upper() for vt in clusters[0]['tiers'])
-                            
-                            if has_live_dbox_host:
-                                clusters[0]['failed_tiers'].append(ft) # Dock the crashed Base into the live D-Box cluster
-                            else:
-                                clusters.append({'seat_ids': set(), 'tiers': [], 'failed_tiers': [ft]})
+                    # ✨ NEW: THE PERFECT SMART ROUTER (BIPARTITE MATCHING) ✨
+                    failed_bases = [ft for ft in failed_tiers if not ft.get('is_dbox')]
+                    failed_dboxes = [ft for ft in failed_tiers if ft.get('is_dbox')]
 
-                    # 🎬 THE MASTER MATRIX (UNIFIED ALLOCATION ALGORITHM)
+                    # 1. Distribute D-BOX overlays to Base rooms
+                    for ft in failed_dboxes:
+                        docked = False
+                        for cluster in clusters:
+                            has_dbox = any(t['tier_info'].get('is_dbox') for t in cluster['tiers']) or \
+                                       any(t.get('is_dbox') for t in cluster['failed_tiers'])
+                            if not has_dbox:
+                                cluster['failed_tiers'].append(ft)
+                                docked = True
+                                break
+                        if not docked:
+                            # Create an orphaned D-Box cluster
+                            clusters.append({'seat_ids': set(), 'tiers': [], 'failed_tiers': [ft]})
+
+                    # 2. Distribute Failed Base rooms to Orphaned D-Box overlays
+                    for ft in failed_bases:
+                        docked = False
+                        for cluster in clusters:
+                            has_base = any(not t['tier_info'].get('is_dbox') for t in cluster['tiers']) or \
+                                       any(not t.get('is_dbox') for t in cluster['failed_tiers'])
+                            if not has_base:
+                                cluster['failed_tiers'].append(ft)
+                                docked = True
+                                break
+                        if not docked:
+                            # Create a standalone Base cluster
+                            clusters.append({'seat_ids': set(), 'tiers': [], 'failed_tiers': [ft]})
+
+                    # 🎬 THE UNIFIED MASTER MATRIX
                     for c_idx, cluster in enumerate(clusters):
                         combined_total = combined_booked = 0
                         combined_gross = 0.0
@@ -521,14 +534,17 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         is_multi_tier = (len(cluster['tiers']) + len(cluster['failed_tiers'])) > 1
                         healed_tiers_info = [] # ✨ NEW: Tracks specific tiers healed for accurate logging
 
-                        # Sort valid tiers by cache capacity (descending) to find the base map
-                        # If there are no valid tiers (e.g., this is a standalone failed Base tier), skip valid logic
+                        # Find the logical Base Tier in this cluster
                         base_vt = None
-                        if cluster['tiers']:
-                            cluster['tiers'].sort(
+                        valid_base_tiers = [t for t in cluster['tiers'] if not t['tier_info'].get('is_dbox')]
+                        if valid_base_tiers:
+                            valid_base_tiers.sort(
                                 key=lambda x: int(x['data'].get('areas', [{}])[0].get('totalSeatCount', 0)) if x.get('data', {}).get('areas') else 0, 
                                 reverse=True
                             )
+                            base_vt = valid_base_tiers[0]
+                        elif cluster['tiers']:
+                            # Fallback if somehow ONLY a live dbox exists in this cluster
                             base_vt = cluster['tiers'][0]
                         
                         safe_avg_price = AVG_PRICE
