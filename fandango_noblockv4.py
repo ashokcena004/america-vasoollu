@@ -884,17 +884,6 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
     }
 
 
-def normalize_xd_format_rows(rows):
-    for row in rows:
-        show_format = str(row.get('format', '')).strip()
-        compact_format = re.sub(r"[^A-Z0-9]", "", show_format.upper())
-        has_xd = "CINEMARKXD" in compact_format or re.search(
-            r"(?<![A-Z0-9])XD(?![A-Z0-9])", show_format.upper()
-        )
-        if has_xd:
-            row['format'] = "Cinemark XD"
-
-
 def generate_run_reports(master_shows_data, previous_shows_data, last_updated_str):
     os.makedirs("reports", exist_ok=True)
 
@@ -1467,9 +1456,6 @@ if __name__ == "__main__":
     # =========================================================================
     # ── 4.9 SAVE REPORT ARTIFACTS (GitHub Actions Downloadable, Not Committed) ─
     # =========================================================================
-    normalize_xd_format_rows(master_shows_data)
-    normalize_xd_format_rows(previous_shows_data)
-    normalize_xd_format_rows(recent_shows_data)
 
     generated_reports = {}
     if master_shows_data:
