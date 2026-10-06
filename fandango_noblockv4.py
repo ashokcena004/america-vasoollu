@@ -182,7 +182,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         
                         # 2. EXTRACT FORMAT SCANNER ONLY FOR REPORTS (Restores precise casing)
                         show_format = base_format
-                        premium_keywords = ["XD", "IMAX", "3D", "DOLBY", "SCREENX", "4DX", "RPX", "PRIME", "BIGD", "XPLUS", "D-BOX", "70MM", "SONY", "DFX", "LASER", "ATMOS"]
+                        premium_keywords = ["XD", "IMAX", "3D", "LASER AT AMC", "4DX", "RPX", "D-BOX"]
                         for am_name, am_up in zip(raw_amenities, raw_amenities_upper):
                             if any(k in am_up for k in premium_keywords) and show_format == base_format:
                                 show_format = am_name
