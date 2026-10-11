@@ -1,22 +1,17 @@
-"""Add or update multiple Fandango tier entries in Firebase's hash capacity cache."""
+"""Import a Fandango hash-capacity export into one movie/date cache."""
 
+import argparse
 from datetime import datetime
 import json
 import math
 import os
 from pathlib import Path
 
-import firebase_admin
-from dotenv import load_dotenv
-from firebase_admin import credentials, db
-
-# Set these values before running the script.
-MOVIE_SLUG = ""
-SHOW_DATE = ""
-HASH_CACHE_ENTRIES = [
-    # Add one dictionary per show/tier:
-    # {"hash_id": "v2-...", "capacity": 198, "format": "Cinemark XD", "max_gross": 6326.10},
-]
+DEFAULT_MOVIE_SLUG = "jailer-2"
+DEFAULT_SHOW_DATE = "2026-10-14"
+DEFAULT_EXPORT_PATH = (
+    Path.home() / "Downloads" / "fandango-web-default-rtdb-hash_capacity_cache-export.json"
+)
 
 
 def validate_database_key(value: str, name: str) -> str:
@@ -36,47 +31,56 @@ def validate_show_date(value: str) -> str:
     return value
 
 
-def add_hash_cache_entries(
-    movie_slug: str,
-    show_date: str,
-) -> tuple[str, int]:
-    movie_slug = validate_database_key(movie_slug, "movie-slug")
-    show_date = validate_show_date(show_date)
-
-    if not HASH_CACHE_ENTRIES:
-        raise ValueError("Add at least one entry to HASH_CACHE_ENTRIES.")
+def load_hash_cache_export(export_path: Path) -> dict:
+    """Load and validate an exported {hash_id: cache_entry} JSON object."""
+    with export_path.open("r", encoding="utf-8") as export_file:
+        exported_entries = json.load(export_file)
+    if not isinstance(exported_entries, dict) or not exported_entries:
+        raise ValueError("The cache export must be a non-empty JSON object keyed by hash ID.")
 
     cache_entries = {}
-    for index, entry in enumerate(HASH_CACHE_ENTRIES, start=1):
+    for hash_id, entry in exported_entries.items():
+        hash_id = validate_database_key(hash_id, "hash-id")
         if not isinstance(entry, dict):
-            raise ValueError(f"HASH_CACHE_ENTRIES item {index} must be a dictionary.")
+            raise ValueError(f"Cache entry {hash_id} must be a JSON object.")
 
-        hash_id = validate_database_key(entry.get("hash_id", ""), f"item {index} hash-id")
         capacity = entry.get("capacity")
         show_format = entry.get("format")
         max_gross = entry.get("max_gross")
-
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 0:
-            raise ValueError(f"Item {index} capacity must be a whole number that is zero or greater.")
+            raise ValueError(f"Cache entry {hash_id} capacity must be a whole number >= 0.")
         if not isinstance(show_format, str) or not show_format.strip():
-            raise ValueError(f"Item {index} format must not be empty.")
+            raise ValueError(f"Cache entry {hash_id} format must not be empty.")
         if isinstance(max_gross, bool) or not isinstance(max_gross, (int, float)):
-            raise ValueError(f"Item {index} max_gross must be a number.")
+            raise ValueError(f"Cache entry {hash_id} max_gross must be a number.")
         if not math.isfinite(max_gross) or max_gross < 0:
-            raise ValueError(f"Item {index} max_gross must be finite and zero or greater.")
-        if hash_id in cache_entries:
-            raise ValueError(f"Duplicate hash_id in HASH_CACHE_ENTRIES: {hash_id}")
+            raise ValueError(f"Cache entry {hash_id} max_gross must be finite and >= 0.")
 
         cache_entries[hash_id] = {
             "capacity": capacity,
             "format": show_format.strip(),
             "max_gross": float(max_gross),
         }
+    return cache_entries
+
+
+def add_hash_cache_entries(
+    movie_slug: str,
+    show_date: str,
+    cache_entries: dict,
+) -> tuple[str, int, int]:
+    movie_slug = validate_database_key(movie_slug, "movie-slug")
+    show_date = validate_show_date(show_date)
+    if not cache_entries:
+        raise ValueError("The cache export contains no entries to import.")
 
     firebase_creds_json = os.environ.get("FIREBASE_CREDENTIALS")
     firebase_db_url = os.environ.get("FIREBASE_DATABASE_URL")
     if not firebase_creds_json or not firebase_db_url:
         raise RuntimeError("FIREBASE_CREDENTIALS and FIREBASE_DATABASE_URL must be set in the environment or .env file.")
+
+    import firebase_admin
+    from firebase_admin import credentials, db
 
     credentials_data = json.loads(firebase_creds_json)
     if not isinstance(credentials_data, dict):
@@ -86,21 +90,47 @@ def add_hash_cache_entries(
         credential = credentials.Certificate(credentials_data)
         firebase_admin.initialize_app(credential, {"databaseURL": firebase_db_url})
 
-    cache_path = f"markets/usa/movies/{movie_slug}/{show_date}/hash_capacity_cache"
-    db.reference(cache_path).update(cache_entries)
-    return cache_path, len(cache_entries)
+    cache_path = (
+        f"markets/usa/movies/{movie_slug}/dates/{show_date}"
+        "/scraper_state/hash_capacity_cache"
+    )
+    cache_ref = db.reference(cache_path)
+    existing_entries = cache_ref.get() or {}
+    if not isinstance(existing_entries, dict):
+        raise ValueError(f"Existing Firebase cache at {cache_path} is not an object.")
+
+    new_entries = {
+        hash_id: entry
+        for hash_id, entry in cache_entries.items()
+        if hash_id not in existing_entries
+    }
+    if new_entries:
+        cache_ref.update(new_entries)
+    return cache_path, len(new_entries), len(cache_entries) - len(new_entries)
 
 
 def main() -> None:
-    if not MOVIE_SLUG or not SHOW_DATE:
-        raise ValueError("Set MOVIE_SLUG and SHOW_DATE at the top of the script.")
+    parser = argparse.ArgumentParser(
+        description="Append missing hash-capacity entries from a Fandango JSON export."
+    )
+    parser.add_argument("--movie-slug", default=DEFAULT_MOVIE_SLUG)
+    parser.add_argument("--show-date", default=DEFAULT_SHOW_DATE)
+    parser.add_argument("--input", type=Path, default=DEFAULT_EXPORT_PATH)
+    args = parser.parse_args()
+
+    from dotenv import load_dotenv
 
     load_dotenv(Path(__file__).resolve().parent / ".env")
-    cache_path, entry_count = add_hash_cache_entries(
-        movie_slug=MOVIE_SLUG,
-        show_date=SHOW_DATE,
+    cache_entries = load_hash_cache_export(args.input)
+    cache_path, added_count, skipped_count = add_hash_cache_entries(
+        movie_slug=args.movie_slug,
+        show_date=args.show_date,
+        cache_entries=cache_entries,
     )
-    print(f"Updated {entry_count} hash cache entr{'y' if entry_count == 1 else 'ies'} at: {cache_path}")
+    print(
+        f"Imported {added_count} new hash entr{'y' if added_count == 1 else 'ies'} "
+        f"({skipped_count} existing hash IDs left unchanged) at: {cache_path}"
+    )
 
 
 if __name__ == "__main__":

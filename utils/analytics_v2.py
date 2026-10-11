@@ -300,21 +300,6 @@ def _aggregate(rows, comparison_rows, time_fallback_minutes=0):
     return shows, dimensions, changes
 
 
-def _paged_rankings(items):
-    sorted_items = {
-        "gross": sorted(items, key=lambda item: (-item["booked_gross"], item["id"])),
-        "growth": sorted(items, key=lambda item: (-item["gross_delta"], item["id"])),
-        "tickets": sorted(items, key=lambda item: (-item["booked_tickets"], item["id"])),
-    }
-    return {
-        sort_key: {
-            f"{page_number:04d}": sorted_items[sort_key][start:start + PAGE_SIZE]
-            for page_number, start in enumerate(range(0, len(sorted_items[sort_key]), PAGE_SIZE), 1)
-        }
-        for sort_key in sorted_items
-    }
-
-
 def build_analytics_payload(
     rows,
     market_id,
@@ -323,9 +308,13 @@ def build_analytics_payload(
     run_id,
     previous_rows=None,
     daily_baseline_rows=None,
+    previous_run_id=None,
+    previous_run_observed_at=None,
+    daily_snapshot_id=None,
+    daily_snapshot_observed_at=None,
     currency="USD",
 ):
-    """Return current rollups, page indexes, detail rows, and slim comparison data."""
+    """Build complete summary rollups and paged details for one immutable run."""
     observed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     normalized = [_normalize_show(row) for row in rows]
     previous_normalized = [_normalize_show(row) for row in (previous_rows or [])]
@@ -334,20 +323,20 @@ def build_analytics_payload(
     current_shows, dimensions, previous_changes = _aggregate(
         normalized, previous_normalized, time_fallback_minutes=60
     )
-    _, daily_dimensions, daily_changes = _aggregate(
+    daily_shows, daily_dimensions, daily_changes = _aggregate(
         normalized, daily_normalized, time_fallback_minutes=60
     )
     metrics = _metrics(normalized)
     previous_metrics = _metrics(previous_normalized)
     daily_metrics = _metrics(daily_normalized)
-    metrics["previous_run_delta"] = {
+    previous_run_delta = {
         "booked_gross": metrics["booked_gross"] - previous_metrics["booked_gross"],
         "booked_tickets": metrics["booked_tickets"] - previous_metrics["booked_tickets"],
         "capacity_seats": metrics["capacity_seats"] - previous_metrics["capacity_seats"],
         "show_count": metrics["show_count"] - previous_metrics["show_count"],
         "theater_count": metrics["theater_count"] - previous_metrics["theater_count"],
     }
-    metrics["daily_baseline_delta"] = {
+    daily_snapshot_delta = {
         "booked_gross": metrics["booked_gross"] - daily_metrics["booked_gross"],
         "booked_tickets": metrics["booked_tickets"] - daily_metrics["booked_tickets"],
         "capacity_seats": metrics["capacity_seats"] - daily_metrics["capacity_seats"],
@@ -355,28 +344,56 @@ def build_analytics_payload(
         "theater_count": metrics["theater_count"] - daily_metrics["theater_count"],
     }
 
-    dimension_documents = {}
-    dimension_pages = {}
+    tables = {}
     for dimension, entities in dimensions.items():
-        items = sorted(entities.values(), key=lambda item: (-item["booked_gross"], item["id"]))
-        dimension_documents[dimension] = {
-            "count": len(items),
-            "top": items[:PAGE_SIZE],
+        daily_entities = daily_dimensions[dimension]
+        rows_by_id = []
+        for entity_id, item in entities.items():
+            daily_item = daily_entities.get(entity_id, {})
+            rows_by_id.append({
+                **item,
+                "gross_delta_previous_run": item["gross_delta"],
+                "tickets_delta_previous_run": item["tickets_delta"],
+                "shows_delta_previous_run": item["shows_delta"],
+                "gross_delta_daily_snapshot": daily_item.get("gross_delta", item["booked_gross"]),
+                "tickets_delta_daily_snapshot": daily_item.get("tickets_delta", item["booked_tickets"]),
+                "shows_delta_daily_snapshot": daily_item.get("shows_delta", item["show_count"]),
+            })
+        tables[dimension] = sorted(
+            rows_by_id,
+            key=lambda item: (-item["booked_gross"], item["id"]),
+        )
+    raw_details = {
+        normalized_row["show_id"]: {
+            key: raw_row[key]
+            for key in (
+                "state", "city", "region", "t_id", "theater", "format",
+                "language", "time", "status", "price_str", "total", "booked",
+                "gross", "is_extra",
+            )
+            if key in raw_row
         }
-        dimension_pages[dimension] = _paged_rankings(items)
-    daily_dimension_documents = {}
-    daily_dimension_pages = {}
-    for dimension, entities in daily_dimensions.items():
-        items = sorted(entities.values(), key=lambda item: (-item["booked_gross"], item["id"]))
-        daily_dimension_documents[dimension] = {
-            "count": len(items),
-            "top": items[:PAGE_SIZE],
+        for raw_row, normalized_row in zip(rows, normalized)
+        if not normalized_row["is_extra"]
+    }
+    details = {}
+    for show_id, current_row in current_shows.items():
+        daily_row = daily_shows.get(show_id)
+        details[show_id] = {
+            **raw_details.get(show_id, {}),
+            "gross_delta_previous_run": current_row["gross_delta"],
+            "tickets_delta_previous_run": current_row["tickets_delta"],
+            "gross_delta_daily_snapshot": (
+                daily_row["gross_delta"] if daily_row else current_row["booked_gross"]
+            ),
+            "tickets_delta_daily_snapshot": (
+                daily_row["tickets_delta"] if daily_row else current_row["booked_tickets"]
+            ),
         }
-        daily_dimension_pages[dimension] = _paged_rankings(items)
 
     return {
         "current": {
-            "schema_version": 2,
+            "schema_version": 3,
             "market_id": market_id,
             "movie_id": movie_id,
             "show_date": show_date,
@@ -384,29 +401,40 @@ def build_analytics_payload(
             "observed_at": observed_at,
             "currency": currency,
             "metrics": metrics,
-            "dimensions": dimension_documents,
-            "comparison": {
+            "tables": tables,
+            "growth": {
                 "previous_run": {
                     "available": bool(previous_rows),
+                    "base_run_id": previous_run_id,
+                    "observed_at": previous_run_observed_at,
+                    "metrics": previous_run_delta,
+                },
+                "daily_snapshot": {
+                    "available": bool(daily_baseline_rows),
+                    "base_snapshot_id": daily_snapshot_id,
+                    "observed_at": daily_snapshot_observed_at,
+                    "metrics": daily_snapshot_delta,
+                },
+            },
+            "comparison": {
+                "previous_run": {
+                    "base_run_id": previous_run_id,
+                    "available": bool(previous_rows),
+                    "observed_at": previous_run_observed_at,
                     "change_counts": {key: len(value) for key, value in previous_changes.items()},
                 },
-                "daily_baseline": {
+                "daily_snapshot": {
+                    "base_snapshot_id": daily_snapshot_id,
                     "available": bool(daily_baseline_rows),
-                    "dimensions": daily_dimension_documents,
+                    "observed_at": daily_snapshot_observed_at,
                     "change_counts": {key: len(value) for key, value in daily_changes.items()},
                 },
             },
         },
-        "details": {
-            show_id: raw_row
-            for raw_row, normalized_row in zip(rows, normalized)
-            for show_id in (normalized_row["show_id"],)
-        },
-        "dimension_pages": dimension_pages,
-        "daily_dimension_pages": daily_dimension_pages,
+        "details": details,
         "change_pages": {
             "previous_run": previous_changes,
-            "daily_baseline": daily_changes,
+            "daily_snapshot": daily_changes,
         },
         "comparison_baseline": {
             show_id: {
@@ -422,13 +450,10 @@ def build_analytics_payload(
             for show_id in (normalized_row["show_id"],)
         },
         "history_entry": {
-            "run_id": run_id,
             "timestamp": observed_at,
             "total_gross": metrics["booked_gross"],
             "booked_tickets": metrics["booked_tickets"],
-            "capacity_seats": metrics["capacity_seats"],
             "occupancy": metrics["occupancy_rate"],
-            "venues": metrics["theater_count"],
             "shows": metrics["show_count"],
         },
     }
@@ -473,19 +498,6 @@ def publish_analytics_payload(
             show_id: shows[show_id] for show_id in page_ids
         })
 
-    for dimension, sortings in payload["dimension_pages"].items():
-        for sort_key, pages in sortings.items():
-            for page_number, page_rows in pages.items():
-                db.reference(
-                    f"{run_root}/pages/dimensions/{dimension}/{sort_key}/{page_number}"
-                ).set(page_rows)
-    for dimension, sortings in payload["daily_dimension_pages"].items():
-        for sort_key, pages in sortings.items():
-            for page_number, page_rows in pages.items():
-                db.reference(
-                    f"{run_root}/pages/daily_dimensions/{dimension}/{sort_key}/{page_number}"
-                ).set(page_rows)
-
     for comparison_name, changes in payload["change_pages"].items():
         for change_type, changed_rows in changes.items():
             ordered_changes = sorted(
@@ -501,12 +513,6 @@ def publish_analytics_payload(
                     f"{run_root}/pages/comparisons/{comparison_name}/{change_type}/{page_number:04d}"
                 ).set(ordered_changes[offset:offset + PAGE_SIZE])
 
-    baseline_ref = db.reference(f"{root}/comparison_baselines/previous_run")
-    baseline_ref.set({
-        "run_id": run_id,
-        "observed_at": payload["current"]["observed_at"],
-        "shows": payload["comparison_baseline"],
-    })
     if update_daily_baseline:
         db.reference(f"{root}/comparison_baselines/daily").set({
             "run_id": run_id,
@@ -516,17 +522,48 @@ def publish_analytics_payload(
 
     db.reference(f"{root}/history/{run_id}").set(payload["history_entry"])
     advance_run_id = run_id if update_advance_snapshot else previous_advance_run_id
-    published_ref.set({
+    detail_count = len(shows)
+    detail_page_count = (detail_count + PAGE_SIZE - 1) // PAGE_SIZE
+    previous_detail_count = previous.get("advance_detail_count")
+    previous_detail_page_count = previous.get("advance_detail_page_count")
+    if previous_advance_run_id and previous_detail_count is None:
+        if previous_advance_run_id == previous_run_id:
+            previous_detail_count = previous.get("detail_count", 0)
+            previous_detail_page_count = previous.get("detail_page_count")
+        else:
+            advance_summary = db.reference(
+                f"{root}/analytics_v2/runs/{previous_advance_run_id}/summary"
+            ).get() or {}
+            previous_detail_count = (advance_summary.get("metrics") or {}).get(
+                "show_count", 0
+            )
+    previous_detail_count = int(previous_detail_count or 0)
+    previous_detail_page_count = int(
+        previous_detail_page_count
+        if previous_detail_page_count is not None
+        else (previous_detail_count + PAGE_SIZE - 1) // PAGE_SIZE
+    )
+    advance_detail_count = detail_count if update_advance_snapshot else previous_detail_count
+    advance_detail_page_count = (
+        detail_page_count if update_advance_snapshot else previous_detail_page_count
+    )
+    published_value = {
         "schema_version": 2,
         "active_run_id": run_id,
         "advance_run_id": advance_run_id,
         "observed_at": payload["current"]["observed_at"],
         "details_available": bool(shows),
-        "detail_count": len(shows),
+        "detail_count": detail_count,
         "detail_page_size": PAGE_SIZE,
-        "detail_page_count": (len(shows) + PAGE_SIZE - 1) // PAGE_SIZE,
-        "advance_details_available": bool(advance_run_id),
-    })
+        "detail_page_count": detail_page_count,
+        "advance_details_available": bool(advance_run_id and advance_detail_count),
+        "active_detail_count": detail_count,
+        "active_detail_page_count": detail_page_count,
+        "active_details_available": bool(shows),
+        "advance_detail_count": advance_detail_count,
+        "advance_detail_page_count": advance_detail_page_count,
+    }
+    published_ref.set(published_value)
 
     for old_run_id in {previous_run_id, previous_advance_run_id} - {None, run_id, advance_run_id}:
         db.reference(f"{root}/movie_details/runs/{old_run_id}").delete()

@@ -997,11 +997,11 @@ if __name__ == "__main__":
     else:
         try:
             if not firebase_admin._apps:
-                if firebase_creds_file:
+                if firebase_creds_json:
+                    creds_dict = json.loads(firebase_creds_json)
+                elif firebase_creds_file:
                     with open(firebase_creds_file, "r", encoding="utf-8") as credentials_file:
                         creds_dict = json.load(credentials_file)
-                else:
-                    creds_dict = json.loads(firebase_creds_json)
                 cred = credentials.Certificate(creds_dict)
                 firebase_admin.initialize_app(cred, {'databaseURL': firebase_db_url})
             firebase_initialized = True
@@ -1025,6 +1025,8 @@ if __name__ == "__main__":
             print(f"❌ Failed to initialize Firebase: {e}")
 
     previous_shows_data = []  # Specifically for OVERWRITE_SNAPSHOT baseline tracking
+    daily_snapshot_id = None
+    daily_snapshot_observed_at = None
     last_updated_str = "First Run"
     
     recent_shows_data = []    # This replaces the Excel read. This is the run directly before this one.
@@ -1039,7 +1041,10 @@ if __name__ == "__main__":
             recent_shows_data = load_v2_show_pages(
                 date_root,
                 active_run_id,
-                int(published.get("detail_page_count") or 0),
+                int(published.get(
+                    "active_detail_page_count",
+                    published.get("detail_page_count", 0),
+                ) or 0),
             )
             recent_shows_timestamp = published.get("observed_at")
             print(f"📈 Loaded {len(recent_shows_data)} shows from V2 run {active_run_id}.")
@@ -1049,11 +1054,13 @@ if __name__ == "__main__":
         daily_baseline = db.reference(
             f"{date_root}/comparison_baselines/daily"
         ).get() or {}
+        daily_snapshot_id = daily_baseline.get("run_id")
         if daily_baseline.get("shows"):
             previous_shows_data = [
                 row for row in daily_baseline["shows"].values()
                 if isinstance(row, dict)
             ]
+            daily_snapshot_observed_at = daily_baseline.get("observed_at")
             last_updated_str = daily_baseline.get("observed_at", "Unknown Time")
             try:
                 ist_tz = timezone(timedelta(hours=5, minutes=30))
@@ -1588,6 +1595,10 @@ if __name__ == "__main__":
                 run_id=run_timestamp.strftime("%Y%m%dT%H%M%S%fZ"),
                 previous_rows=recent_shows_data,
                 daily_baseline_rows=previous_shows_data,
+                previous_run_id=active_run_id if firebase_initialized else None,
+                previous_run_observed_at=recent_shows_timestamp,
+                daily_snapshot_id=daily_snapshot_id,
+                daily_snapshot_observed_at=daily_snapshot_observed_at,
                 currency="USD",
             )
             publish_analytics_payload(
