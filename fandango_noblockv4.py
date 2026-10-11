@@ -18,6 +18,7 @@ load_dotenv()
 
 import firebase_admin
 from firebase_admin import credentials, db
+from utils.analytics_v2 import build_analytics_payload, publish_analytics_payload
 
 from utils.generateFandangoExcelReport import export_master_excel
 from utils.generateFandangoHTMLReport import generate_fandango_html_report
@@ -923,6 +924,22 @@ def generate_run_reports(master_shows_data, previous_shows_data, last_updated_st
         "image": image_path,
     }
 
+
+def load_v2_show_pages(date_root, run_id, page_count):
+    """Read the prior published detail run needed by scraper-side reconciliation."""
+    rows = []
+    for page_number in range(1, page_count + 1):
+        page = db.reference(
+            f"{date_root}/movie_details/runs/{run_id}/pages/{page_number:04d}"
+        ).get()
+        if not isinstance(page, dict):
+            raise RuntimeError(
+                f"Published detail page {page_number:04d} is missing for run {run_id}."
+            )
+        rows.extend(row for row in page.values() if isinstance(row, dict))
+    return rows
+
+
 # =============================================================================
 # ── MAIN EXECUTION ───────────────────────────────────────────────────────────
 # =============================================================================
@@ -969,17 +986,22 @@ if __name__ == "__main__":
     # =========================================================================
     
     firebase_creds_json = os.environ.get("FIREBASE_CREDENTIALS")
+    firebase_creds_file = os.environ.get("FIREBASE_CREDENTIALS_FILE")
     firebase_db_url = os.environ.get("FIREBASE_DATABASE_URL")
     firebase_initialized = False
     master_hash_cache = {} # ✨ NEW: Master Hash Database
     new_hash_entries = {}  # ✨ NEW: Tracks hashes learned this run to upload
 
-    if not firebase_creds_json or not firebase_db_url:
+    if (not firebase_creds_json and not firebase_creds_file) or not firebase_db_url:
         print("⚠️ Firebase Credentials or Database URL missing from Environment Variables.")
     else:
         try:
             if not firebase_admin._apps:
-                creds_dict = json.loads(firebase_creds_json)
+                if firebase_creds_json:
+                    creds_dict = json.loads(firebase_creds_json)
+                elif firebase_creds_file:
+                    with open(firebase_creds_file, "r", encoding="utf-8") as credentials_file:
+                        creds_dict = json.load(credentials_file)
                 cred = credentials.Certificate(creds_dict)
                 firebase_admin.initialize_app(cred, {'databaseURL': firebase_db_url})
             firebase_initialized = True
@@ -987,7 +1009,9 @@ if __name__ == "__main__":
             # ✨ FETCH HASH CACHE ✨
             print("📡 Fetching Global Hash Cache from Firebase...")
             try:
-                hash_ref = db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/hash_capacity_cache")
+                hash_ref = db.reference(
+                    f"markets/usa/movies/{MOVIE_SLUG}/dates/{SHOW_DATE}/scraper_state/hash_capacity_cache"
+                )
                 cached_hashes = hash_ref.get()
                 if cached_hashes:
                     master_hash_cache = cached_hashes
@@ -1001,43 +1025,54 @@ if __name__ == "__main__":
             print(f"❌ Failed to initialize Firebase: {e}")
 
     previous_shows_data = []  # Specifically for OVERWRITE_SNAPSHOT baseline tracking
+    daily_snapshot_id = None
+    daily_snapshot_observed_at = None
     last_updated_str = "First Run"
     
     recent_shows_data = []    # This replaces the Excel read. This is the run directly before this one.
     recent_shows_timestamp = None
 
     if firebase_initialized:
-        print("\n📡 Fetching previous snapshot from Firebase for momentum tracking (last_snapshot)...")
-        try:
-            snap_ref = db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/last_snapshot")
-            snapshot_data = snap_ref.get()
-            if snapshot_data and "data" in snapshot_data:
-                previous_shows_data = snapshot_data["data"]
-                last_updated_str = snapshot_data.get("timestamp", "Unknown Time")
-                try:
-                    ist_tz = timezone(timedelta(hours=5, minutes=30))
-                    dt_obj = datetime.fromisoformat(last_updated_str.replace('Z', '+00:00')).astimezone(ist_tz)
-                    last_updated_str = dt_obj.strftime('%d %b %Y, %I:%M %p')
-                except Exception:
-                    pass
-                print(f"📈 Loaded previous snapshot from {last_updated_str}.")
-            else:
-                print("ℹ️ No previous snapshot found in Firebase.")
-        except Exception as e:
-            print(f"⚠️ Failed to fetch previous snapshot from Firebase: {e}")
+        date_root = f"markets/usa/movies/{MOVIE_SLUG}/dates/{SHOW_DATE}"
+        print("\n📡 Fetching the published V2 pointers and compact daily baseline...")
+        published = db.reference(f"{date_root}/published").get() or {}
+        active_run_id = published.get("active_run_id")
+        if active_run_id:
+            recent_shows_data = load_v2_show_pages(
+                date_root,
+                active_run_id,
+                int(published.get(
+                    "active_detail_page_count",
+                    published.get("detail_page_count", 0),
+                ) or 0),
+            )
+            recent_shows_timestamp = published.get("observed_at")
+            print(f"📈 Loaded {len(recent_shows_data)} shows from V2 run {active_run_id}.")
+        else:
+            print("ℹ️ No published V2 run exists yet.")
 
-        print("\n📡 Fetching previous run data from Firebase (master_shows_data) for Missing Shows detection...")
-        try:
-            master_ref = db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/master_shows_data")
-            master_data = master_ref.get()
-            if master_data and "data" in master_data:
-                recent_shows_data = master_data["data"]
-                recent_shows_timestamp = master_data.get("last_updated", datetime.utcnow().isoformat() + "Z")
-                print(f"📈 Loaded {len(recent_shows_data)} recent shows directly from Firebase (master_shows_data).")
-            else:
-                print("ℹ️ No master_shows_data found in Firebase. Skipping Missing Shows check.")
-        except Exception as e:
-            print(f"⚠️ Failed to fetch master_shows_data from Firebase: {e}")
+        daily_baseline = db.reference(
+            f"{date_root}/comparison_baselines/daily"
+        ).get() or {}
+        daily_snapshot_id = daily_baseline.get("run_id")
+        if daily_baseline.get("shows"):
+            previous_shows_data = [
+                row for row in daily_baseline["shows"].values()
+                if isinstance(row, dict)
+            ]
+            daily_snapshot_observed_at = daily_baseline.get("observed_at")
+            last_updated_str = daily_baseline.get("observed_at", "Unknown Time")
+            try:
+                ist_tz = timezone(timedelta(hours=5, minutes=30))
+                dt_obj = datetime.fromisoformat(
+                    last_updated_str.replace("Z", "+00:00")
+                ).astimezone(ist_tz)
+                last_updated_str = dt_obj.strftime("%d %b %Y, %I:%M %p")
+            except (TypeError, ValueError):
+                pass
+            print(f"📈 Loaded manual daily baseline from {last_updated_str}.")
+        else:
+            print("ℹ️ No manually selected daily baseline exists yet.")
 
 
     # 3. EXECUTE THREAD POOL
@@ -1544,97 +1579,38 @@ if __name__ == "__main__":
             if new_hash_entries:
                 try:
                     print(f"💾 Saving {len(new_hash_entries)} newly learned Hash Blueprints to Firebase...")
-                    db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/hash_capacity_cache").update(new_hash_entries)
+                    db.reference(
+                        f"markets/usa/movies/{MOVIE_SLUG}/dates/{SHOW_DATE}/scraper_state/hash_capacity_cache"
+                    ).update(new_hash_entries)
                     print("✅ Hash Cache updated successfully.")
                 except Exception as e:
                     print(f"⚠️ Failed to update Hash Cache: {e}")
 
-            # 1. Update the Snapshot if requested (Baseline Tracking)
-            if OVERWRITE_SNAPSHOT:
-                try:
-                    print("💾 Saving current data as the new snapshot to Firebase...")
-                    snap_ref = db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/last_snapshot")
-                    snap_ref.set({
-                        "timestamp": datetime.utcnow().isoformat() + "Z",
-                        "data": master_shows_data
-                    })
-                    print("✅ Snapshot updated successfully in Firebase.")
-                except Exception as e:
-                    print(f"⚠️ Failed to save snapshot to Firebase: {e}")
-            else:
-                print(f"⏭️ Skipping snapshot save (OVERWRITE_SNAPSHOT is set to False).")
-
-            # 2. Save the PREVIOUS Run Data (Using data fetched at the start of the script)
-            if recent_shows_data:
-                try:
-                    print("💾 Saving previous run data to Firebase (previous_run_snapshot)...")
-                    prev_run_ref = db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/previous_run_snapshot")
-                    prev_run_ref.set({
-                        "timestamp": recent_shows_timestamp,
-                        "data": recent_shows_data
-                    })
-                    print(f"✅ Successfully uploaded previous_run_snapshot to Firebase (Timestamp: {recent_shows_timestamp})!")
-                except Exception as e:
-                    print(f"⚠️ Failed to upload previous_run_snapshot to Firebase: {e}")
-            else:
-                print("ℹ️ No previous run data available to upload.")
-
-            # 3. Save the CURRENT Run Data
-            try:
-                print(f"Connecting to Firebase Database to upload current data: {firebase_db_url}")
-                ref = db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/master_shows_data")
-                
-                payload = {
-                    "last_updated": datetime.utcnow().isoformat() + "Z",
-                    "show_date": SHOW_DATE,
-                    "data": master_shows_data
-                }
-                
-                if momentum_msg:
-                    payload["momentum"] = momentum_msg
-                    
-                ref.set(payload)
-                
-                print("✅ Successfully uploaded master_shows_data to Firebase!")
-
-                # Advance Sales Snapshot
-                if not CUMULATIVE_TRACKING_MODE:
-                    db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/advance_snapshot"
-                    ).set(payload)
-
-                    print("🔥 Successfully updated advance_snapshot!")
-            except Exception as e:
-                print(f"❌ Failed to upload to Firebase: {e}")
-                traceback.print_exc()
-
-            # 4. Append to History
-            try:
-                print("💾 Appending current run to history in Firebase...")
-                history_ref = db.reference(f"markets/usa/movies/{MOVIE_SLUG}/{SHOW_DATE}/history")
-                
-                calc_shows = [r for r in master_shows_data if not r.get('is_extra')]
-                venues_count = len(set(r.get('t_id') for r in calc_shows))
-                shows_count = len(calc_shows)
-                total_gross = sum(r.get('gross', 0) for r in master_shows_data)
-                booked_tickets = sum(r.get('booked', 0) for r in master_shows_data)
-                total_seats = sum(r.get('total', 0) for r in master_shows_data)
-                occupancy = (booked_tickets / total_seats * 100) if total_seats > 0 else 0
-                
-                history_payload = {
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
-                    "total_gross": total_gross,
-                    "booked_tickets": booked_tickets,
-                    "venues": venues_count,
-                    "shows": shows_count,
-                    "occupancy": occupancy,
-                    "growth": float(diff_gross)
-                }
-                
-                history_ref.push(history_payload)
-                print("✅ Successfully appended history data to Firebase!")
-                
-            except Exception as e:
-                print(f"⚠️ Failed to append history to Firebase: {e}")
+            run_timestamp = datetime.now(timezone.utc)
+            analytics_payload = build_analytics_payload(
+                master_shows_data,
+                market_id="usa",
+                movie_id=MOVIE_SLUG,
+                show_date=SHOW_DATE,
+                run_id=run_timestamp.strftime("%Y%m%dT%H%M%S%fZ"),
+                previous_rows=recent_shows_data,
+                daily_baseline_rows=previous_shows_data,
+                previous_run_id=active_run_id if firebase_initialized else None,
+                previous_run_observed_at=recent_shows_timestamp,
+                daily_snapshot_id=daily_snapshot_id,
+                daily_snapshot_observed_at=daily_snapshot_observed_at,
+                currency="USD",
+            )
+            publish_analytics_payload(
+                db,
+                "usa",
+                MOVIE_SLUG,
+                SHOW_DATE,
+                analytics_payload,
+                update_daily_baseline=OVERWRITE_SNAPSHOT,
+                update_advance_snapshot=not CUMULATIVE_TRACKING_MODE,
+            )
+            print("✅ V2 analytics summary and detail pages published.")
 
         pipeline_elapsed = time.time() - PIPELINE_START_TIME
         mins, secs = divmod(pipeline_elapsed, 60)

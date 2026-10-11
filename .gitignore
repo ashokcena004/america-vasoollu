@@ -1,5 +1,8 @@
 logs/
 reports/
 .env
+*firebase-adminsdk*.json
+serviceAccount*.json
+service-account*.json
 git_token.txt
 __pycache__/

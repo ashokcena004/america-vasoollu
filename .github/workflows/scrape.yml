@@ -48,7 +48,7 @@ jobs:
       - name: Run Fandango Scraper
         env:
           FIREBASE_CREDENTIALS: ${{ secrets.FIREBASE_CREDENTIALS }}
-          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_DATABASE_URL: https://wkndcinema-default-rtdb.asia-southeast1.firebasedatabase.app
           OVERWRITE_SNAPSHOT: "false"
           PLAYWRIGHT_BROWSER_TRACKING: "1"
         run: |
