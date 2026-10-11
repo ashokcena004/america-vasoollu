@@ -201,6 +201,14 @@ def _match_previous_rows(rows, comparison_rows, time_fallback_minutes):
     return matches, [comparison_rows[index] for index in sorted(unmatched_previous)]
 
 
+def _legacy_growth_key(row):
+    return (
+        row["theater_id"],
+        row["local_start_time"],
+        _normalized_format(row["format_name"]),
+    )
+
+
 def _metrics(rows):
     capacity = sum(row["capacity_seats"] for row in rows)
     booked = sum(row["booked_tickets"] for row in rows)
@@ -220,22 +228,11 @@ def _aggregate(rows, comparison_rows, time_fallback_minutes=0):
         rows, comparison_rows, time_fallback_minutes
     )
     dimensions = {name: {} for name in DIMENSIONS}
-    baseline_dimensions = defaultdict(list)
-    for row in comparison_rows:
-        if row["is_extra"]:
-            continue
-        for dimension, field in {
-            "regions": "region_id",
-            "states": "state_id",
-            "cities": "city_id",
-            "chains": "chain_id",
-            "platforms": "platform_id",
-            "theaters": "theater_id",
-            "formats": "format_id",
-            "languages": "language_id",
-            "time_buckets": "time_bucket_id",
-        }.items():
-            baseline_dimensions[(dimension, row[field])].append(row)
+    growth_previous_by_key = {
+        _legacy_growth_key(row): row
+        for row in comparison_rows
+        if not row["is_extra"]
+    }
     shows = {}
     changes = {
         "added": [],
@@ -247,11 +244,21 @@ def _aggregate(rows, comparison_rows, time_fallback_minutes=0):
 
     for row_index, row in enumerate(rows):
         previous = matched_rows.get(row_index)
+        growth_previous = growth_previous_by_key.get(_legacy_growth_key(row))
         row = dict(row)
         row["has_comparison"] = previous is not None
         row["gross_delta"] = row["booked_gross"] - _number(previous and previous.get("booked_gross"))
         row["tickets_delta"] = row["booked_tickets"] - _number(previous and previous.get("booked_tickets"))
         row["capacity_delta"] = row["capacity_seats"] - _number(previous and previous.get("capacity_seats"))
+        row["growth_gross_delta"] = (
+            row["booked_gross"]
+            - _number(growth_previous and growth_previous.get("booked_gross"))
+        )
+        row["growth_tickets_delta"] = (
+            row["booked_tickets"]
+            - _number(growth_previous and growth_previous.get("booked_tickets"))
+        )
+        row["growth_shows_delta"] = int(growth_previous is None)
         if not row["is_extra"]:
             shows[row["show_id"]] = row
             if previous is None and comparison_rows:
@@ -275,7 +282,7 @@ def _aggregate(rows, comparison_rows, time_fallback_minutes=0):
                         "time_buckets": "time_bucket_id",
                     }[dimension]
                 ]
-                grouped_rows[(dimension, entity_id)].append((row, previous))
+                grouped_rows[(dimension, entity_id)].append(row)
 
     for previous in removed_rows:
         removed = dict(previous)
@@ -283,37 +290,11 @@ def _aggregate(rows, comparison_rows, time_fallback_minutes=0):
         removed["tickets_delta"] = -_number(previous.get("booked_tickets"))
         changes["removed"].append(removed)
 
-    current_adjustments = [row for row in rows if row["is_extra"]]
-    baseline_adjustments = [row for row in comparison_rows if row["is_extra"]]
-    if current_adjustments or baseline_adjustments:
-        current_adjustment_metrics = _metrics(current_adjustments)
-        baseline_adjustment_metrics = _metrics(baseline_adjustments)
-        adjustment = {
-            **current_adjustment_metrics,
-            "id": "unattributed-adjustments",
-            "name": "Unattributed Adjustments",
-            "gross_delta": (
-                current_adjustment_metrics["booked_gross"]
-                - baseline_adjustment_metrics["booked_gross"]
-            ),
-            "tickets_delta": (
-                current_adjustment_metrics["booked_tickets"]
-                - baseline_adjustment_metrics["booked_tickets"]
-            ),
-            "shows_delta": 0,
-        }
-        for dimension in DIMENSIONS:
-            dimensions[dimension][adjustment["id"]] = dict(adjustment)
-
     for dimension in DIMENSIONS:
         entity_ids = {
             entity_id
             for grouped_dimension, entity_id in grouped_rows
             if grouped_dimension == dimension
-        } | {
-            entity_id
-            for baseline_dimension, entity_id in baseline_dimensions
-            if baseline_dimension == dimension
         }
         label_field = {
             "regions": "region_name",
@@ -328,17 +309,14 @@ def _aggregate(rows, comparison_rows, time_fallback_minutes=0):
         }[dimension]
         for entity_id in entity_ids:
             members = grouped_rows.get((dimension, entity_id), [])
-            current_rows = [row for row, _ in members]
-            baseline_rows = baseline_dimensions[(dimension, entity_id)]
+            current_rows = members
             current_metrics = _metrics(current_rows)
-            baseline_metrics = _metrics(baseline_rows)
-            label_row = current_rows[0] if current_rows else baseline_rows[0]
             current_metrics.update({
                 "id": entity_id,
-                "name": label_row[label_field],
-                "gross_delta": current_metrics["booked_gross"] - baseline_metrics["booked_gross"],
-                "tickets_delta": current_metrics["booked_tickets"] - baseline_metrics["booked_tickets"],
-                "shows_delta": current_metrics["show_count"] - baseline_metrics["show_count"],
+                "name": current_rows[0][label_field],
+                "gross_delta": sum(row["growth_gross_delta"] for row in current_rows),
+                "tickets_delta": sum(row["growth_tickets_delta"] for row in current_rows),
+                "shows_delta": sum(row["growth_shows_delta"] for row in current_rows),
                 "occupancy_rate": (
                     current_metrics["booked_tickets"] / current_metrics["capacity_seats"] * 100
                     if current_metrics["capacity_seats"] else 0
@@ -397,23 +375,8 @@ def build_analytics_payload(
     for dimension, entities in dimensions.items():
         daily_entities = daily_dimensions[dimension]
         rows_by_id = []
-        for entity_id in entities.keys() | daily_entities.keys():
-            item = entities.get(entity_id)
+        for entity_id, item in entities.items():
             daily_item = daily_entities.get(entity_id, {})
-            if item is None:
-                item = {
-                    "id": entity_id,
-                    "name": daily_item["name"],
-                    "show_count": 0,
-                    "theater_count": 0,
-                    "capacity_seats": 0,
-                    "booked_tickets": 0,
-                    "booked_gross": 0,
-                    "occupancy_rate": 0,
-                    "gross_delta": 0,
-                    "tickets_delta": 0,
-                    "shows_delta": 0,
-                }
             rows_by_id.append({
                 **item,
                 "gross_delta_previous_run": item["gross_delta"],
@@ -445,13 +408,13 @@ def build_analytics_payload(
         daily_row = daily_shows.get(show_id)
         details[show_id] = {
             **raw_details.get(show_id, {}),
-            "gross_delta_previous_run": current_row["gross_delta"],
-            "tickets_delta_previous_run": current_row["tickets_delta"],
+            "gross_delta_previous_run": current_row["growth_gross_delta"],
+            "tickets_delta_previous_run": current_row["growth_tickets_delta"],
             "gross_delta_daily_snapshot": (
-                daily_row["gross_delta"] if daily_row else current_row["booked_gross"]
+                daily_row["growth_gross_delta"] if daily_row else current_row["booked_gross"]
             ),
             "tickets_delta_daily_snapshot": (
-                daily_row["tickets_delta"] if daily_row else current_row["booked_tickets"]
+                daily_row["growth_tickets_delta"] if daily_row else current_row["booked_tickets"]
             ),
         }
 

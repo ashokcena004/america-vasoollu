@@ -133,6 +133,34 @@ class AnalyticsV2Tests(unittest.TestCase):
             0,
         )
 
+    def test_breakdown_growth_preserves_legacy_duplicate_key_matching(self):
+        current = [
+            dict(make_show("7:30 PM", 25, 250), seat_map_urls="https://example.invalid/map/a"),
+            dict(make_show("7:30 PM", 35, 350), seat_map_urls="https://example.invalid/map/b"),
+        ]
+        previous = [
+            dict(make_show("7:30 PM", 20, 200), seat_map_urls="https://example.invalid/map/a"),
+            dict(make_show("7:30 PM", 30, 300), seat_map_urls="https://example.invalid/map/b"),
+        ]
+
+        payload = build_analytics_payload(
+            current,
+            market_id="usa",
+            movie_id="example-film",
+            show_date="2026-10-10",
+            run_id="run-current",
+            previous_rows=previous,
+        )
+        format_row = payload["current"]["tables"]["formats"][0]
+        language_row = payload["current"]["tables"]["languages"][0]
+
+        self.assertEqual(format_row["gross_delta_previous_run"], 0)
+        self.assertEqual(language_row["gross_delta_previous_run"], 0)
+        self.assertEqual(
+            payload["current"]["growth"]["previous_run"]["metrics"]["booked_gross"],
+            100,
+        )
+
     def test_time_match_handles_midnight_boundary(self):
         summary = self.build(
             [make_show("12:20 AM", 20, 200)],
@@ -282,13 +310,14 @@ class AnalyticsV2Tests(unittest.TestCase):
             100,
         )
         for dimension_rows in payload["current"]["tables"].values():
-            self.assertEqual(
-                sum(row["booked_gross"] for row in dimension_rows),
-                payload["current"]["metrics"]["booked_gross"],
-            )
+            self.assertEqual(len(dimension_rows), 1)
             self.assertEqual(
                 sum(row["gross_delta_previous_run"] for row in dimension_rows),
-                payload["current"]["growth"]["previous_run"]["metrics"]["booked_gross"],
+                100,
+            )
+            self.assertNotIn(
+                "Unattributed Adjustments",
+                [row["name"] for row in dimension_rows],
             )
         database = FakeDatabase()
         publish_analytics_payload(
@@ -306,7 +335,7 @@ class AnalyticsV2Tests(unittest.TestCase):
             [current_extra],
         )
 
-    def test_removed_extra_adjustment_reconciles_all_dimension_deltas(self):
+    def test_removed_extra_is_excluded_from_dimension_growth(self):
         current = make_show("8:00 PM", 20, 200)
         previous = make_show("8:00 PM", 15, 150)
         previous_extra = {
@@ -333,29 +362,22 @@ class AnalyticsV2Tests(unittest.TestCase):
         )
         summary = payload["current"]
         expected_gross_delta = summary["growth"]["previous_run"]["metrics"]["booked_gross"]
-        adjustment_id = "unattributed-adjustments"
-
         self.assertAlmostEqual(expected_gross_delta, -21459.54)
         for dimension_rows in summary["tables"].values():
-            self.assertAlmostEqual(
-                sum(row["gross_delta_previous_run"] for row in dimension_rows),
-                expected_gross_delta,
-            )
+            self.assertEqual(len(dimension_rows), 1)
+            self.assertAlmostEqual(sum(
+                row["gross_delta_previous_run"] for row in dimension_rows
+            ), 50)
             self.assertAlmostEqual(
                 sum(row["gross_delta_daily_snapshot"] for row in dimension_rows),
-                summary["growth"]["daily_snapshot"]["metrics"]["booked_gross"],
+                50,
             )
-            self.assertAlmostEqual(
-                sum(row["booked_gross"] for row in dimension_rows),
-                summary["metrics"]["booked_gross"],
+            self.assertNotIn(
+                "Unattributed Adjustments",
+                [row["name"] for row in dimension_rows],
             )
-            adjustment = next(row for row in dimension_rows if row["id"] == adjustment_id)
-            self.assertEqual(adjustment["name"], "Unattributed Adjustments")
-            self.assertEqual(adjustment["booked_gross"], 0)
-            self.assertEqual(adjustment["gross_delta_previous_run"], -21509.54)
-            self.assertEqual(adjustment["tickets_delta_previous_run"], -726)
 
-    def test_dimension_growth_includes_entities_removed_since_previous_run(self):
+    def test_dimension_growth_uses_current_shows_only_like_legacy_reports(self):
         current_show = make_show("8:00 PM", 20, 200)
         previous_matching_show = make_show("8:00 PM", 15, 150)
         previous_removed_show = make_show("9:00 PM", 10, 100)
@@ -382,25 +404,12 @@ class AnalyticsV2Tests(unittest.TestCase):
             daily_baseline_rows=[daily_matching_show, daily_removed_show],
         )
         summary = payload["current"]
-        expected_gross_delta = summary["growth"]["previous_run"]["metrics"]["booked_gross"]
-        expected_daily_gross_delta = summary["growth"]["daily_snapshot"]["metrics"]["booked_gross"]
-
         for dimension in ("formats", "languages"):
             rows = summary["tables"][dimension]
-            self.assertEqual(sum(row["gross_delta_previous_run"] for row in rows), expected_gross_delta)
-            self.assertEqual(sum(row["gross_delta_daily_snapshot"] for row in rows), expected_daily_gross_delta)
-            self.assertEqual(sum(row["booked_gross"] for row in rows), summary["metrics"]["booked_gross"])
-
-        removed_format = next(
-            row for row in summary["tables"]["formats"] if row["name"] == "D-Box"
-        )
-        self.assertEqual(removed_format["booked_gross"], 0)
-        self.assertEqual(removed_format["gross_delta_previous_run"], -100)
-        daily_only_format = next(
-            row for row in summary["tables"]["formats"] if row["name"] == "Premium"
-        )
-        self.assertEqual(daily_only_format["booked_gross"], 0)
-        self.assertEqual(daily_only_format["gross_delta_daily_snapshot"], -80)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["name"], "Standard" if dimension == "formats" else "Tamil")
+            self.assertEqual(sum(row["gross_delta_previous_run"] for row in rows), 50)
+            self.assertEqual(sum(row["gross_delta_daily_snapshot"] for row in rows), 80)
 
     def test_publisher_writes_only_daily_snapshot_and_preserves_distinct_advance_run(self):
         database = FakeDatabase()
