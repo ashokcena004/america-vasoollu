@@ -936,7 +936,11 @@ def load_v2_show_pages(date_root, run_id, page_count):
             raise RuntimeError(
                 f"Published detail page {page_number:04d} is missing for run {run_id}."
             )
-        rows.extend(row for row in page.values() if isinstance(row, dict))
+        rows.extend(
+            {**row, "_analytics_show_id": show_id}
+            for show_id, row in page.items()
+            if isinstance(row, dict)
+        )
     return rows
 
 
@@ -1104,7 +1108,8 @@ if __name__ == "__main__":
         baseline_shows = daily_baseline.get("shows")
         if isinstance(baseline_shows, dict):
             previous_shows_data = [
-                row for row in baseline_shows.values()
+                {**row, "_analytics_show_id": show_id}
+                for show_id, row in baseline_shows.items()
                 if isinstance(row, dict)
             ]
             previous_shows_data.extend(
@@ -1113,7 +1118,8 @@ if __name__ == "__main__":
             )
         else:
             previous_shows_data = [
-                row for key, row in daily_baseline.items()
+                {**row, "_analytics_show_id": key}
+                for key, row in daily_baseline.items()
                 if key not in {"run_id", "observed_at", "extras"}
                 and isinstance(row, dict)
             ]

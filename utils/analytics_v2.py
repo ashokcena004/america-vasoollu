@@ -63,7 +63,7 @@ def _time_bucket(value):
 
 
 def _show_id(row):
-    identity = "|".join(
+    identity_parts = [
         str(value or "").strip().lower()
         for value in (
             row.get("t_id"),
@@ -73,7 +73,20 @@ def _show_id(row):
             row.get("format"),
             row.get("language"),
         )
-    )
+    ]
+    seat_map_urls = row.get("seat_map_urls")
+    if isinstance(seat_map_urls, str):
+        seat_map_urls = seat_map_urls.split("|")
+    if isinstance(seat_map_urls, (list, tuple, set)):
+        stable_urls = sorted({
+            str(url).strip().lower()
+            for url in seat_map_urls
+            if str(url).strip()
+        })
+        if stable_urls:
+            identity_parts.append("|".join(stable_urls))
+
+    identity = "|".join(identity_parts)
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
 
@@ -111,7 +124,7 @@ def _normalize_show(row):
         chain = "Other / Independents"
 
     return {
-        "show_id": _show_id(row),
+        "show_id": str(row.get("_analytics_show_id") or _show_id(row)),
         "theater_id": str(row.get("t_id") or theater),
         "theater_name": str(theater),
         "region_id": _key(region),
@@ -270,9 +283,38 @@ def _aggregate(rows, comparison_rows, time_fallback_minutes=0):
         removed["tickets_delta"] = -_number(previous.get("booked_tickets"))
         changes["removed"].append(removed)
 
-    for (dimension, entity_id), members in grouped_rows.items():
-        current_metrics = _metrics([row for row, _ in members])
-        baseline_metrics = _metrics(baseline_dimensions[(dimension, entity_id)])
+    current_adjustments = [row for row in rows if row["is_extra"]]
+    baseline_adjustments = [row for row in comparison_rows if row["is_extra"]]
+    if current_adjustments or baseline_adjustments:
+        current_adjustment_metrics = _metrics(current_adjustments)
+        baseline_adjustment_metrics = _metrics(baseline_adjustments)
+        adjustment = {
+            **current_adjustment_metrics,
+            "id": "unattributed-adjustments",
+            "name": "Unattributed Adjustments",
+            "gross_delta": (
+                current_adjustment_metrics["booked_gross"]
+                - baseline_adjustment_metrics["booked_gross"]
+            ),
+            "tickets_delta": (
+                current_adjustment_metrics["booked_tickets"]
+                - baseline_adjustment_metrics["booked_tickets"]
+            ),
+            "shows_delta": 0,
+        }
+        for dimension in DIMENSIONS:
+            dimensions[dimension][adjustment["id"]] = dict(adjustment)
+
+    for dimension in DIMENSIONS:
+        entity_ids = {
+            entity_id
+            for grouped_dimension, entity_id in grouped_rows
+            if grouped_dimension == dimension
+        } | {
+            entity_id
+            for baseline_dimension, entity_id in baseline_dimensions
+            if baseline_dimension == dimension
+        }
         label_field = {
             "regions": "region_name",
             "states": "state_name",
@@ -284,18 +326,25 @@ def _aggregate(rows, comparison_rows, time_fallback_minutes=0):
             "languages": "language_name",
             "time_buckets": "time_bucket_name",
         }[dimension]
-        current_metrics.update({
-            "id": entity_id,
-            "name": members[0][0][label_field],
-            "gross_delta": current_metrics["booked_gross"] - baseline_metrics["booked_gross"],
-            "tickets_delta": current_metrics["booked_tickets"] - baseline_metrics["booked_tickets"],
-            "shows_delta": current_metrics["show_count"] - baseline_metrics["show_count"],
-            "occupancy_rate": (
-                current_metrics["booked_tickets"] / current_metrics["capacity_seats"] * 100
-                if current_metrics["capacity_seats"] else 0
-            ),
-        })
-        dimensions[dimension][entity_id] = current_metrics
+        for entity_id in entity_ids:
+            members = grouped_rows.get((dimension, entity_id), [])
+            current_rows = [row for row, _ in members]
+            baseline_rows = baseline_dimensions[(dimension, entity_id)]
+            current_metrics = _metrics(current_rows)
+            baseline_metrics = _metrics(baseline_rows)
+            label_row = current_rows[0] if current_rows else baseline_rows[0]
+            current_metrics.update({
+                "id": entity_id,
+                "name": label_row[label_field],
+                "gross_delta": current_metrics["booked_gross"] - baseline_metrics["booked_gross"],
+                "tickets_delta": current_metrics["booked_tickets"] - baseline_metrics["booked_tickets"],
+                "shows_delta": current_metrics["show_count"] - baseline_metrics["show_count"],
+                "occupancy_rate": (
+                    current_metrics["booked_tickets"] / current_metrics["capacity_seats"] * 100
+                    if current_metrics["capacity_seats"] else 0
+                ),
+            })
+            dimensions[dimension][entity_id] = current_metrics
 
     return shows, dimensions, changes
 
@@ -348,16 +397,31 @@ def build_analytics_payload(
     for dimension, entities in dimensions.items():
         daily_entities = daily_dimensions[dimension]
         rows_by_id = []
-        for entity_id, item in entities.items():
+        for entity_id in entities.keys() | daily_entities.keys():
+            item = entities.get(entity_id)
             daily_item = daily_entities.get(entity_id, {})
+            if item is None:
+                item = {
+                    "id": entity_id,
+                    "name": daily_item["name"],
+                    "show_count": 0,
+                    "theater_count": 0,
+                    "capacity_seats": 0,
+                    "booked_tickets": 0,
+                    "booked_gross": 0,
+                    "occupancy_rate": 0,
+                    "gross_delta": 0,
+                    "tickets_delta": 0,
+                    "shows_delta": 0,
+                }
             rows_by_id.append({
                 **item,
                 "gross_delta_previous_run": item["gross_delta"],
                 "tickets_delta_previous_run": item["tickets_delta"],
                 "shows_delta_previous_run": item["shows_delta"],
-                "gross_delta_daily_snapshot": daily_item.get("gross_delta", item["booked_gross"]),
-                "tickets_delta_daily_snapshot": daily_item.get("tickets_delta", item["booked_tickets"]),
-                "shows_delta_daily_snapshot": daily_item.get("shows_delta", item["show_count"]),
+                "gross_delta_daily_snapshot": daily_item.get("gross_delta", 0),
+                "tickets_delta_daily_snapshot": daily_item.get("tickets_delta", 0),
+                "shows_delta_daily_snapshot": daily_item.get("shows_delta", 0),
             })
         tables[dimension] = sorted(
             rows_by_id,
