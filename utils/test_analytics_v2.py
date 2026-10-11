@@ -194,6 +194,62 @@ class AnalyticsV2Tests(unittest.TestCase):
         self.assertNotIn("region_id", detail)
         self.assertNotIn("seat_map_urls", detail)
 
+    def test_manual_extra_gross_is_included_in_previous_run_baseline(self):
+        current = make_show("8:00 PM", 20, 200)
+        previous = make_show("8:00 PM", 10, 100)
+        current_extra = {
+            "state": "EXTRA",
+            "t_id": "EXTRA",
+            "theater": "EXTRA",
+            "format": "EXTRA",
+            "language": "EXTRA",
+            "time": "",
+            "total": 100,
+            "booked": 100,
+            "gross": 19000,
+            "is_extra": True,
+        }
+        previous_extra = dict(current_extra)
+
+        payload = build_analytics_payload(
+            [current, current_extra],
+            market_id="usa",
+            movie_id="example-film",
+            show_date="2026-10-10",
+            run_id="run-current",
+            previous_rows=[previous, previous_extra],
+            daily_baseline_rows=[previous, previous_extra],
+        )
+
+        self.assertEqual(
+            payload["current"]["growth"]["previous_run"]["metrics"]["booked_gross"],
+            100,
+        )
+        self.assertEqual(
+            payload["current"]["growth"]["daily_snapshot"]["metrics"]["booked_gross"],
+            100,
+        )
+        self.assertEqual(payload["comparison_baseline"]["extras"], [current_extra])
+        self.assertEqual(
+            sum(row["gross_delta"] for row in payload["change_pages"]["previous_run"]["tickets_increased"]),
+            100,
+        )
+        database = FakeDatabase()
+        publish_analytics_payload(
+            database,
+            "usa",
+            "example-film",
+            "2026-10-10",
+            payload,
+            update_daily_baseline=True,
+        )
+        self.assertEqual(
+            database.values[
+                "markets/usa/movies/example-film/dates/2026-10-10/comparison_baselines/daily"
+            ]["extras"],
+            [current_extra],
+        )
+
     def test_publisher_writes_only_daily_snapshot_and_preserves_distinct_advance_run(self):
         database = FakeDatabase()
         root = "markets/usa/movies/example-film/dates/2026-10-10"

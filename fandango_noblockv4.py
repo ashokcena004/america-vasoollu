@@ -940,6 +940,45 @@ def load_v2_show_pages(date_root, run_id, page_count):
     return rows
 
 
+def append_unpublished_extra_metrics(rows, metrics):
+    """Recover hidden manual adjustments omitted from show-detail and legacy baseline rows."""
+    if not isinstance(metrics, dict):
+        return
+
+    totals = {
+        "gross": sum(float(row.get("gross") or 0) for row in rows),
+        "booked": sum(float(row.get("booked") or 0) for row in rows),
+        "total": sum(float(row.get("total") or 0) for row in rows),
+    }
+    summary_values = {
+        "gross": float(metrics.get("booked_gross") or 0),
+        "booked": float(metrics.get("booked_tickets") or 0),
+        "total": float(metrics.get("capacity_seats") or 0),
+    }
+    remainder = {
+        key: summary_values[key] - totals[key]
+        for key in totals
+    }
+    if any(value < -0.01 for value in remainder.values()):
+        print(f"⚠️ Cannot safely reconstruct hidden EXTRA rows; negative remainder: {remainder}")
+        return
+
+    extra = {key: max(0, value) for key, value in remainder.items()}
+    if any(value > 0.01 for value in extra.values()):
+        rows.append({
+            "state": "EXTRA",
+            "t_id": "EXTRA",
+            "theater": "EXTRA",
+            "format": "EXTRA",
+            "language": "EXTRA",
+            "time": "",
+            "total": extra["total"],
+            "booked": extra["booked"],
+            "gross": extra["gross"],
+            "is_extra": True,
+        })
+
+
 # =============================================================================
 # ── MAIN EXECUTION ───────────────────────────────────────────────────────────
 # =============================================================================
@@ -1046,6 +1085,13 @@ if __name__ == "__main__":
                     published.get("detail_page_count", 0),
                 ) or 0),
             )
+            previous_summary = db.reference(
+                f"{date_root}/analytics_v2/runs/{active_run_id}/summary"
+            ).get() or {}
+            append_unpublished_extra_metrics(
+                recent_shows_data,
+                previous_summary.get("metrics"),
+            )
             recent_shows_timestamp = published.get("observed_at")
             print(f"📈 Loaded {len(recent_shows_data)} shows from V2 run {active_run_id}.")
         else:
@@ -1055,11 +1101,34 @@ if __name__ == "__main__":
             f"{date_root}/comparison_baselines/daily"
         ).get() or {}
         daily_snapshot_id = daily_baseline.get("run_id")
-        if daily_baseline.get("shows"):
+        baseline_shows = daily_baseline.get("shows")
+        if isinstance(baseline_shows, dict):
             previous_shows_data = [
-                row for row in daily_baseline["shows"].values()
+                row for row in baseline_shows.values()
                 if isinstance(row, dict)
             ]
+            previous_shows_data.extend(
+                row for row in daily_baseline.get("extras", [])
+                if isinstance(row, dict)
+            )
+        else:
+            previous_shows_data = [
+                row for key, row in daily_baseline.items()
+                if key not in {"run_id", "observed_at", "extras"}
+                and isinstance(row, dict)
+            ]
+        if previous_shows_data and daily_snapshot_id:
+            daily_history_entry = db.reference(
+                f"{date_root}/history/{daily_snapshot_id}"
+            ).get() or {}
+            if "total_gross" in daily_history_entry and "booked_tickets" in daily_history_entry:
+                append_unpublished_extra_metrics(previous_shows_data, {
+                    "booked_gross": daily_history_entry.get("total_gross"),
+                    "booked_tickets": daily_history_entry.get("booked_tickets"),
+                    "capacity_seats": sum(
+                        float(row.get("total") or 0) for row in previous_shows_data
+                    ),
+                })
             daily_snapshot_observed_at = daily_baseline.get("observed_at")
             last_updated_str = daily_baseline.get("observed_at", "Unknown Time")
             try:

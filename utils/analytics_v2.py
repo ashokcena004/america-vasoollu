@@ -437,17 +437,31 @@ def build_analytics_payload(
             "daily_snapshot": daily_changes,
         },
         "comparison_baseline": {
-            show_id: {
-                key: raw_row[key]
-                for key in (
-                    "state", "t_id", "theater", "format", "language", "time",
-                    "status", "price_str", "total", "booked", "gross", "is_extra",
-                )
-                if key in raw_row
-            }
-            for raw_row, normalized_row in zip(rows, normalized)
-            if not normalized_row["is_extra"]
-            for show_id in (normalized_row["show_id"],)
+            "shows": {
+                show_id: {
+                    key: raw_row[key]
+                    for key in (
+                        "state", "t_id", "theater", "format", "language", "time",
+                        "status", "price_str", "total", "booked", "gross", "is_extra",
+                    )
+                    if key in raw_row
+                }
+                for raw_row, normalized_row in zip(rows, normalized)
+                if not normalized_row["is_extra"]
+                for show_id in (normalized_row["show_id"],)
+            },
+            "extras": [
+                {
+                    key: raw_row[key]
+                    for key in (
+                        "state", "t_id", "theater", "format", "language", "time",
+                        "status", "price_str", "total", "booked", "gross", "is_extra",
+                    )
+                    if key in raw_row
+                }
+                for raw_row, normalized_row in zip(rows, normalized)
+                if normalized_row["is_extra"]
+            ],
         },
         "history_entry": {
             "timestamp": observed_at,
@@ -517,7 +531,7 @@ def publish_analytics_payload(
         db.reference(f"{root}/comparison_baselines/daily").set({
             "run_id": run_id,
             "observed_at": payload["current"]["observed_at"],
-            "shows": payload["comparison_baseline"],
+            **payload["comparison_baseline"],
         })
 
     db.reference(f"{root}/history/{run_id}").set(payload["history_entry"])

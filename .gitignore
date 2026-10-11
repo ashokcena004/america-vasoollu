@@ -1,6 +1,7 @@
 logs/
 reports/
 .env
+.venv
 *firebase-adminsdk*.json
 serviceAccount*.json
 service-account*.json
