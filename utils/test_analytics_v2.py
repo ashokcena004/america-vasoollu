@@ -133,7 +133,7 @@ class AnalyticsV2Tests(unittest.TestCase):
             0,
         )
 
-    def test_breakdown_growth_preserves_legacy_duplicate_key_matching(self):
+    def test_breakdown_growth_matches_duplicate_show_keys_one_to_one(self):
         current = [
             dict(make_show("7:30 PM", 25, 250), seat_map_urls="https://example.invalid/map/a"),
             dict(make_show("7:30 PM", 35, 350), seat_map_urls="https://example.invalid/map/b"),
@@ -151,13 +151,18 @@ class AnalyticsV2Tests(unittest.TestCase):
             run_id="run-current",
             previous_rows=previous,
         )
-        format_row = payload["current"]["tables"]["formats"][0]
-        language_row = payload["current"]["tables"]["languages"][0]
-
-        self.assertEqual(format_row["gross_delta_previous_run"], 0)
-        self.assertEqual(language_row["gross_delta_previous_run"], 0)
+        summary = payload["current"]
+        for dimension_rows in summary["tables"].values():
+            self.assertEqual(
+                sum(row["gross_delta_previous_run"] for row in dimension_rows),
+                100,
+            )
+            self.assertEqual(
+                sum(row["tickets_delta_previous_run"] for row in dimension_rows),
+                10,
+            )
         self.assertEqual(
-            payload["current"]["growth"]["previous_run"]["metrics"]["booked_gross"],
+            summary["growth"]["previous_run"]["metrics"]["booked_gross"],
             100,
         )
 

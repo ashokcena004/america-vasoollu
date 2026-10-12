@@ -201,14 +201,6 @@ def _match_previous_rows(rows, comparison_rows, time_fallback_minutes):
     return matches, [comparison_rows[index] for index in sorted(unmatched_previous)]
 
 
-def _legacy_growth_key(row):
-    return (
-        row["theater_id"],
-        row["local_start_time"],
-        _normalized_format(row["format_name"]),
-    )
-
-
 def _metrics(rows):
     capacity = sum(row["capacity_seats"] for row in rows)
     booked = sum(row["booked_tickets"] for row in rows)
@@ -228,11 +220,6 @@ def _aggregate(rows, comparison_rows, time_fallback_minutes=0):
         rows, comparison_rows, time_fallback_minutes
     )
     dimensions = {name: {} for name in DIMENSIONS}
-    growth_previous_by_key = {
-        _legacy_growth_key(row): row
-        for row in comparison_rows
-        if not row["is_extra"]
-    }
     shows = {}
     changes = {
         "added": [],
@@ -244,7 +231,6 @@ def _aggregate(rows, comparison_rows, time_fallback_minutes=0):
 
     for row_index, row in enumerate(rows):
         previous = matched_rows.get(row_index)
-        growth_previous = growth_previous_by_key.get(_legacy_growth_key(row))
         row = dict(row)
         row["has_comparison"] = previous is not None
         row["gross_delta"] = row["booked_gross"] - _number(previous and previous.get("booked_gross"))
@@ -252,13 +238,13 @@ def _aggregate(rows, comparison_rows, time_fallback_minutes=0):
         row["capacity_delta"] = row["capacity_seats"] - _number(previous and previous.get("capacity_seats"))
         row["growth_gross_delta"] = (
             row["booked_gross"]
-            - _number(growth_previous and growth_previous.get("booked_gross"))
+            - _number(previous and previous.get("booked_gross"))
         )
         row["growth_tickets_delta"] = (
             row["booked_tickets"]
-            - _number(growth_previous and growth_previous.get("booked_tickets"))
+            - _number(previous and previous.get("booked_tickets"))
         )
-        row["growth_shows_delta"] = int(growth_previous is None)
+        row["growth_shows_delta"] = int(previous is None)
         if not row["is_extra"]:
             shows[row["show_id"]] = row
             if previous is None and comparison_rows:
