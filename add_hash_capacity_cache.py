@@ -9,8 +9,8 @@ from pathlib import Path
 
 DEFAULT_MOVIE_SLUG = "jailer-2"
 DEFAULT_SHOW_DATE = "2026-10-14"
-DEFAULT_EXPORT_PATH = (
-    Path.home() / "Downloads" / "fandango-web-default-rtdb-hash_capacity_cache-export.json"
+DEFAULT_EXPORT_PATH = Path(__file__).resolve().with_name(
+    "fandango-web-default-rtdb-hash_capacity_cache-export.json"
 )
 
 
@@ -68,7 +68,7 @@ def add_hash_cache_entries(
     movie_slug: str,
     show_date: str,
     cache_entries: dict,
-) -> tuple[str, int, int]:
+) -> tuple[str, int]:
     movie_slug = validate_database_key(movie_slug, "movie-slug")
     show_date = validate_show_date(show_date)
     if not cache_entries:
@@ -95,18 +95,8 @@ def add_hash_cache_entries(
         "/scraper_state/hash_capacity_cache"
     )
     cache_ref = db.reference(cache_path)
-    existing_entries = cache_ref.get() or {}
-    if not isinstance(existing_entries, dict):
-        raise ValueError(f"Existing Firebase cache at {cache_path} is not an object.")
-
-    new_entries = {
-        hash_id: entry
-        for hash_id, entry in cache_entries.items()
-        if hash_id not in existing_entries
-    }
-    if new_entries:
-        cache_ref.update(new_entries)
-    return cache_path, len(new_entries), len(cache_entries) - len(new_entries)
+    cache_ref.update(cache_entries)
+    return cache_path, len(cache_entries)
 
 
 def main() -> None:
@@ -122,14 +112,14 @@ def main() -> None:
 
     load_dotenv(Path(__file__).resolve().parent / ".env")
     cache_entries = load_hash_cache_export(args.input)
-    cache_path, added_count, skipped_count = add_hash_cache_entries(
+    cache_path, imported_count = add_hash_cache_entries(
         movie_slug=args.movie_slug,
         show_date=args.show_date,
         cache_entries=cache_entries,
     )
     print(
-        f"Imported {added_count} new hash entr{'y' if added_count == 1 else 'ies'} "
-        f"({skipped_count} existing hash IDs left unchanged) at: {cache_path}"
+        f"Imported {imported_count} hash entr{'y' if imported_count == 1 else 'ies'} "
+        f"at: {cache_path}"
     )
 
 
