@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 
 PAGE_SIZE = 20
@@ -27,6 +27,178 @@ def _number(value):
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _cumulative_metrics(date_entries, sales_scope):
+    included = [
+        entry[sales_scope]
+        for entry in date_entries.values()
+        if isinstance(entry.get(sales_scope), dict)
+    ]
+    return {
+        "booked_gross": sum(_number(entry.get("booked_gross")) for entry in included),
+        "booked_tickets": sum(_number(entry.get("booked_tickets")) for entry in included),
+        "show_count": sum(int(entry.get("show_count") or 0) for entry in included),
+        "observed_show_dates": len(included),
+    }
+
+
+def _publish_cumulative_snapshot(
+    db,
+    market_id,
+    movie_id,
+    show_date,
+    summary,
+    as_of_date,
+    update_advance_snapshot,
+):
+    show_day = date.fromisoformat(show_date)
+    as_of_day = date.fromisoformat(as_of_date)
+    gross_basis = _key(summary["gross_basis"])
+    month_key = show_day.strftime("%Y-%m")
+    cumulative_root = (
+        f"markets/{market_id}/movies/{movie_id}/cumulative/v1/bases/{gross_basis}"
+    )
+    month_ref = db.reference(f"{cumulative_root}/months/{month_key}")
+    contribution = {
+        "run_id": summary["run_id"],
+        "observed_at": summary["observed_at"],
+        "booked_gross": _number(summary["metrics"].get("booked_gross")),
+        "booked_tickets": _number(summary["metrics"].get("booked_tickets")),
+        "show_count": int(summary["metrics"].get("show_count") or 0),
+    }
+    month_metadata = {
+        "schema_version": 1,
+        "market_id": market_id,
+        "movie_id": movie_id,
+        "currency": summary["currency"],
+        "gross_basis": gross_basis,
+        "month": month_key,
+    }
+
+    def update_month(current):
+        month = current if isinstance(current, dict) else {}
+        dates = dict(month.get("dates") or {})
+        previous = dates.get(show_date) or {}
+        updated = dict(previous)
+        if show_day <= as_of_day:
+            previous_current = previous.get("current") or {}
+            if (
+                not previous_current
+                or str(previous_current.get("observed_at", "")) <= contribution["observed_at"]
+            ):
+                if contribution["show_count"]:
+                    updated["current"] = contribution
+                else:
+                    updated.pop("current", None)
+            updated.pop("advance", None)
+        else:
+            updated.pop("current", None)
+            if update_advance_snapshot:
+                previous_advance = previous.get("advance") or {}
+                if (
+                    not previous_advance
+                    or str(previous_advance.get("observed_at", "")) <= contribution["observed_at"]
+                ):
+                    if contribution["show_count"]:
+                        updated["advance"] = contribution
+                    else:
+                        updated.pop("advance", None)
+
+        if updated:
+            dates[show_date] = updated
+        else:
+            dates.pop(show_date, None)
+        changed = dates != (month.get("dates") or {})
+        return {
+            **month_metadata,
+            "revision": int(month.get("revision") or 0) + int(changed),
+            "updated_at": max(
+                str(month.get("updated_at") or ""),
+                summary["observed_at"],
+            ),
+            "dates": dates,
+            "metrics": _cumulative_metrics(dates, "current"),
+            "advance_metrics": _cumulative_metrics(dates, "advance"),
+        }
+
+    month_value = month_ref.transaction(update_month)
+    if not isinstance(month_value, dict):
+        raise RuntimeError(
+            f"Could not read committed cumulative month {month_key} for {movie_id}."
+        )
+
+    month_metrics = month_value.get("metrics") or {}
+    summary_ref = db.reference(f"{cumulative_root}/summary")
+    month_rollup = {
+        "revision": int(month_value.get("revision") or 0),
+        **{
+            key: _number(month_metrics.get(key))
+            for key in ("booked_gross", "booked_tickets", "show_count")
+        },
+        "observed_show_dates": int(month_metrics.get("observed_show_dates") or 0),
+        "advance_metrics": {
+            **{
+                key: _number((month_value.get("advance_metrics") or {}).get(key))
+                for key in ("booked_gross", "booked_tickets", "show_count")
+            },
+            "observed_show_dates": int(
+                (month_value.get("advance_metrics") or {}).get("observed_show_dates") or 0
+            ),
+        },
+    }
+
+    def update_summary(current):
+        cumulative = current if isinstance(current, dict) else {}
+        months = dict(cumulative.get("months") or {})
+        previous_month = months.get(month_key) or {}
+        if month_rollup["revision"] >= int(previous_month.get("revision") or 0):
+            months[month_key] = month_rollup
+
+        return {
+            "schema_version": 1,
+            "market_id": market_id,
+            "movie_id": movie_id,
+            "currency": summary["currency"],
+            "gross_basis": gross_basis,
+            "aggregation": "latest_observed_daily_snapshots",
+            "advance_aggregation": "latest_published_future_date_snapshots",
+            "as_of_date": max(
+                str(cumulative.get("as_of_date") or ""),
+                as_of_date,
+            ),
+            "updated_at": max(
+                str(cumulative.get("updated_at") or ""),
+                summary["observed_at"],
+            ),
+            "months": months,
+            "metrics": {
+                key: sum(_number(month.get(key)) for month in months.values())
+                for key in (
+                    "booked_gross",
+                    "booked_tickets",
+                    "show_count",
+                    "observed_show_dates",
+                )
+            },
+            "advance_metrics": {
+                key: sum(
+                    _number((month.get("advance_metrics") or {}).get(key))
+                    for month in months.values()
+                )
+                for key in (
+                    "booked_gross",
+                    "booked_tickets",
+                    "show_count",
+                    "observed_show_dates",
+                )
+            },
+        }
+
+    summary_value = summary_ref.transaction(update_summary)
+    if not isinstance(summary_value, dict):
+        raise RuntimeError(f"Could not commit cumulative summary for {movie_id}.")
+    return summary_value
 
 
 def _key(value):
@@ -407,6 +579,7 @@ def build_analytics_payload(
     return {
         "current": {
             "schema_version": 3,
+            "gross_basis": "fandango_reported",
             "market_id": market_id,
             "movie_id": movie_id,
             "show_date": show_date,
@@ -494,6 +667,7 @@ def publish_analytics_payload(
     payload,
     update_daily_baseline=False,
     update_advance_snapshot=False,
+    as_of_date=None,
 ):
     """Stage summaries and independently fetchable pages before publishing a pointer."""
     root = f"markets/{market_id}/movies/{movie_id}/dates/{show_date}"
@@ -505,10 +679,6 @@ def publish_analytics_payload(
     db.reference(
         f"markets/{market_id}/movies/{movie_id}/date_index/{show_date}"
     ).set(True)
-    published_ref = db.reference(f"{root}/published")
-    previous = published_ref.get() or {}
-    previous_run_id = previous.get("active_run_id")
-    previous_advance_run_id = previous.get("advance_run_id")
     run_root = f"{root}/analytics_v2/runs/{run_id}"
     db.reference(f"{run_root}/summary").set(payload["current"])
 
@@ -548,6 +718,10 @@ def publish_analytics_payload(
         })
 
     db.reference(f"{root}/history/{run_id}").set(payload["history_entry"])
+    published_ref = db.reference(f"{root}/published")
+    previous = published_ref.get() or {}
+    previous_run_id = previous.get("active_run_id")
+    previous_advance_run_id = previous.get("advance_run_id")
     advance_run_id = run_id if update_advance_snapshot else previous_advance_run_id
     detail_count = len(shows)
     detail_page_count = (detail_count + PAGE_SIZE - 1) // PAGE_SIZE
@@ -590,7 +764,47 @@ def publish_analytics_payload(
         "advance_detail_count": advance_detail_count,
         "advance_detail_page_count": advance_detail_page_count,
     }
-    published_ref.set(published_value)
+    _publish_cumulative_snapshot(
+        db,
+        market_id,
+        movie_id,
+        show_date,
+        payload["current"],
+        as_of_date or datetime.now(timezone.utc).date().isoformat(),
+        update_advance_snapshot,
+    )
+    summary = payload["current"]
+    metrics = summary["metrics"]
+    candidate = None
+    if metrics.get("show_count"):
+        candidate = {
+            "pulse_schema_version": 1,
+            "summary_schema_version": summary["schema_version"],
+            "market_id": market_id,
+            "movie_id": movie_id,
+            "movie_name": str(movie_id).replace("-", " ").replace("_", " ").title(),
+            "show_date": show_date,
+            "run_id": run_id,
+            "observed_at": summary["observed_at"],
+            "currency": summary["currency"],
+            "gross_basis": summary["gross_basis"],
+            "booked_gross": metrics["booked_gross"],
+            "booked_tickets": metrics["booked_tickets"],
+            "show_count": metrics["show_count"],
+            "theater_count": metrics["theater_count"],
+            "capacity_seats": metrics["capacity_seats"],
+            "occupancy_rate": metrics["occupancy_rate"],
+        }
+
+    market_updates = {
+        f"movies/{movie_id}/dates/{show_date}/published": published_value,
+        f"pulse/v1/dates/{show_date}/active/{movie_id}": candidate,
+    }
+    if update_advance_snapshot:
+        market_updates[f"pulse/v1/dates/{show_date}/advance/{movie_id}"] = candidate
+
+    # Publish the pointer and its market-ranking entries as one commit.
+    db.reference(f"markets/{market_id}").update(market_updates)
 
     for old_run_id in {previous_run_id, previous_advance_run_id} - {None, run_id, advance_run_id}:
         db.reference(f"{root}/movie_details/runs/{old_run_id}").delete()

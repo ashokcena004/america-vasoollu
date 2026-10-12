@@ -1,4 +1,5 @@
 import unittest
+from copy import deepcopy
 
 from utils.analytics_v2 import build_analytics_payload, publish_analytics_payload
 
@@ -32,18 +33,35 @@ class FakeReference:
         self.database.writes.append(("set", self.path))
 
     def update(self, value):
-        self.database.values.setdefault(self.path, {}).update(value)
+        self.database.updates.append((self.path, dict(value)))
+        if any("/" in key for key in value):
+            for key, child in value.items():
+                child_path = f"{self.path}/{key}".strip("/")
+                if child is None:
+                    self.database.values.pop(child_path, None)
+                else:
+                    self.database.values[child_path] = child
+        else:
+            self.database.values.setdefault(self.path, {}).update(value)
         self.database.writes.append(("update", self.path))
 
     def delete(self):
         self.database.values.pop(self.path, None)
         self.database.writes.append(("delete", self.path))
 
+    def transaction(self, update_function):
+        current = deepcopy(self.database.values.get(self.path))
+        updated = update_function(current)
+        self.database.values[self.path] = deepcopy(updated)
+        self.database.writes.append(("transaction", self.path))
+        return deepcopy(updated)
+
 
 class FakeDatabase:
     def __init__(self):
         self.values = {}
         self.writes = []
+        self.updates = []
 
     def reference(self, path):
         return FakeReference(self, path)
@@ -455,6 +473,33 @@ class AnalyticsV2Tests(unittest.TestCase):
         pointer = database.values[f"{root}/published"]
         self.assertEqual(pointer["active_run_id"], "active-run")
         self.assertEqual(pointer["advance_run_id"], "advance-run")
+        active_pulse = database.values[
+            "markets/usa/pulse/v1/dates/2026-10-10/active/example-film"
+        ]
+        advance_pulse = database.values[
+            "markets/usa/pulse/v1/dates/2026-10-10/advance/example-film"
+        ]
+        self.assertEqual(active_pulse["run_id"], "active-run")
+        self.assertEqual(active_pulse["booked_gross"], 200)
+        self.assertEqual(active_pulse["gross_basis"], "fandango_reported")
+        self.assertEqual(advance_pulse["run_id"], "advance-run")
+        self.assertEqual(advance_pulse["booked_gross"], 100)
+        market_updates = [
+            updates for path, updates in database.updates if path == "markets/usa"
+        ]
+        self.assertEqual(len(market_updates), 2)
+        self.assertIn(
+            "movies/example-film/dates/2026-10-10/published",
+            market_updates[-1],
+        )
+        self.assertIn(
+            "pulse/v1/dates/2026-10-10/active/example-film",
+            market_updates[-1],
+        )
+        self.assertNotIn(
+            "pulse/v1/dates/2026-10-10/advance/example-film",
+            market_updates[-1],
+        )
         self.assertEqual(pointer["active_detail_count"], 1)
         self.assertEqual(pointer["advance_detail_count"], 1)
         self.assertTrue(pointer["advance_details_available"])
@@ -500,6 +545,162 @@ class AnalyticsV2Tests(unittest.TestCase):
         pointer = database.values[f"{root}/published"]
         self.assertEqual(pointer["advance_detail_count"], 1)
         self.assertEqual(pointer["advance_detail_page_count"], 1)
+
+    def test_cumulative_rollup_replaces_corrected_daily_snapshot_idempotently(self):
+        database = FakeDatabase()
+        first_payload = build_analytics_payload(
+            [make_show("8:00 PM", 10, 100)],
+            market_id="usa",
+            movie_id="example-film",
+            show_date="2026-10-10",
+            run_id="first-run",
+        )
+        publish_analytics_payload(
+            database,
+            "usa",
+            "example-film",
+            "2026-10-10",
+            first_payload,
+            as_of_date="2026-10-12",
+        )
+
+        corrected_payload = build_analytics_payload(
+            [make_show("8:00 PM", 20, 200)],
+            market_id="usa",
+            movie_id="example-film",
+            show_date="2026-10-10",
+            run_id="corrected-run",
+        )
+        publish_analytics_payload(
+            database,
+            "usa",
+            "example-film",
+            "2026-10-10",
+            corrected_payload,
+            as_of_date="2026-10-12",
+        )
+        publish_analytics_payload(
+            database,
+            "usa",
+            "example-film",
+            "2026-10-10",
+            corrected_payload,
+            as_of_date="2026-10-12",
+        )
+
+        summary = database.values[
+            "markets/usa/movies/example-film/cumulative/v1/bases/fandango_reported/summary"
+        ]
+        month = database.values[
+            "markets/usa/movies/example-film/cumulative/v1/bases/fandango_reported/months/2026-10"
+        ]
+        self.assertEqual(summary["aggregation"], "latest_observed_daily_snapshots")
+        self.assertEqual(summary["metrics"]["booked_gross"], 200)
+        self.assertEqual(summary["metrics"]["booked_tickets"], 20)
+        self.assertEqual(summary["metrics"]["observed_show_dates"], 1)
+        self.assertEqual(month["metrics"]["booked_gross"], 200)
+        self.assertEqual(month["revision"], 2)
+
+    def test_cumulative_rollup_excludes_future_show_dates(self):
+        database = FakeDatabase()
+        payload = build_analytics_payload(
+            [make_show("8:00 PM", 10, 100)],
+            market_id="usa",
+            movie_id="example-film",
+            show_date="2026-10-15",
+            run_id="advance-run",
+        )
+        publish_analytics_payload(
+            database,
+            "usa",
+            "example-film",
+            "2026-10-15",
+            payload,
+            update_advance_snapshot=True,
+            as_of_date="2026-10-12",
+        )
+
+        summary = database.values[
+            "markets/usa/movies/example-film/cumulative/v1/bases/fandango_reported/summary"
+        ]
+        month = database.values[
+            "markets/usa/movies/example-film/cumulative/v1/bases/fandango_reported/months/2026-10"
+        ]
+        self.assertEqual(summary["metrics"]["booked_gross"], 0)
+        self.assertEqual(summary["metrics"]["observed_show_dates"], 0)
+        self.assertEqual(summary["advance_metrics"]["booked_gross"], 100)
+        self.assertEqual(summary["advance_metrics"]["observed_show_dates"], 1)
+        self.assertIn("advance", month["dates"]["2026-10-15"])
+
+        current_payload = build_analytics_payload(
+            [make_show("8:00 PM", 12, 120)],
+            market_id="usa",
+            movie_id="example-film",
+            show_date="2026-10-15",
+            run_id="current-run",
+        )
+        publish_analytics_payload(
+            database,
+            "usa",
+            "example-film",
+            "2026-10-15",
+            current_payload,
+            update_advance_snapshot=False,
+            as_of_date="2026-10-15",
+        )
+        summary = database.values[
+            "markets/usa/movies/example-film/cumulative/v1/bases/fandango_reported/summary"
+        ]
+        month = database.values[
+            "markets/usa/movies/example-film/cumulative/v1/bases/fandango_reported/months/2026-10"
+        ]
+        self.assertEqual(summary["metrics"]["booked_gross"], 120)
+        self.assertEqual(summary["advance_metrics"]["booked_gross"], 0)
+        self.assertIn("current", month["dates"]["2026-10-15"])
+        self.assertNotIn("advance", month["dates"]["2026-10-15"])
+
+    def test_empty_snapshot_removes_active_and_advance_pulse_candidates(self):
+        database = FakeDatabase()
+        first_payload = build_analytics_payload(
+            [make_show("8:00 PM", 10, 100)],
+            market_id="usa",
+            movie_id="example-film",
+            show_date="2026-10-10",
+            run_id="first-run",
+        )
+        publish_analytics_payload(
+            database,
+            "usa",
+            "example-film",
+            "2026-10-10",
+            first_payload,
+            update_advance_snapshot=True,
+        )
+        empty_payload = build_analytics_payload(
+            [],
+            market_id="usa",
+            movie_id="example-film",
+            show_date="2026-10-10",
+            run_id="empty-run",
+        )
+
+        publish_analytics_payload(
+            database,
+            "usa",
+            "example-film",
+            "2026-10-10",
+            empty_payload,
+            update_advance_snapshot=True,
+        )
+
+        self.assertNotIn(
+            "markets/usa/pulse/v1/dates/2026-10-10/active/example-film",
+            database.values,
+        )
+        self.assertNotIn(
+            "markets/usa/pulse/v1/dates/2026-10-10/advance/example-film",
+            database.values,
+        )
 
 
 if __name__ == "__main__":

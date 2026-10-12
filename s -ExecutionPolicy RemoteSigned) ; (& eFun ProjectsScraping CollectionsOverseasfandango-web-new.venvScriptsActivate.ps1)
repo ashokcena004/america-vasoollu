@@ -1,0 +1,396 @@
+[1mdiff --git a/fandango_noblockv4.py b/fandango_noblockv4.py[m
+[1mindex 96b3e21..e7831db 100644[m
+[1m--- a/fandango_noblockv4.py[m
+[1m+++ b/fandango_noblockv4.py[m
+[36m@@ -1684,6 +1684,9 @@[m [mif __name__ == "__main__":[m
+                 analytics_payload,[m
+                 update_daily_baseline=OVERWRITE_SNAPSHOT,[m
+                 update_advance_snapshot=not CUMULATIVE_TRACKING_MODE,[m
+[32m+[m[32m                as_of_date=datetime.now([m
+[32m+[m[32m                    pytz.timezone("America/New_York")[m
+[32m+[m[32m                ).date().isoformat(),[m
+             )[m
+             print("✅ V2 analytics summary and detail pages published.")[m
+ [m
+[1mdiff --git a/utils/analytics_v2.py b/utils/analytics_v2.py[m
+[1mindex 5606b73..f1ddae5 100644[m
+[1m--- a/utils/analytics_v2.py[m
+[1m+++ b/utils/analytics_v2.py[m
+[36m@@ -5,7 +5,7 @@[m [mfrom __future__ import annotations[m
+ import hashlib[m
+ import re[m
+ from collections import defaultdict[m
+[31m-from datetime import datetime, timezone[m
+[32m+[m[32mfrom datetime import date, datetime, timezone[m
+ [m
+ [m
+ PAGE_SIZE = 20[m
+[36m@@ -29,6 +29,178 @@[m [mdef _number(value):[m
+         return 0.0[m
+ [m
+ [m
+[32m+[m[32mdef _cumulative_metrics(date_entries, sales_scope):[m
+[32m+[m[32m    included = [[m
+[32m+[m[32m        entry[sales_scope][m
+[32m+[m[32m        for entry in date_entries.values()[m
+[32m+[m[32m        if isinstance(entry.get(sales_scope), dict)[m
+[32m+[m[32m    ][m
+[32m+[m[32m    return {[m
+[32m+[m[32m        "booked_gross": sum(_number(entry.get("booked_gross")) for entry in included),[m
+[32m+[m[32m        "booked_tickets": sum(_number(entry.get("booked_tickets")) for entry in included),[m
+[32m+[m[32m        "show_count": sum(int(entry.get("show_count") or 0) for entry in included),[m
+[32m+[m[32m        "observed_show_dates": len(included),[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _publish_cumulative_snapshot([m
+[32m+[m[32m    db,[m
+[32m+[m[32m    market_id,[m
+[32m+[m[32m    movie_id,[m
+[32m+[m[32m    show_date,[m
+[32m+[m[32m    summary,[m
+[32m+[m[32m    as_of_date,[m
+[32m+[m[32m    update_advance_snapshot,[m
+[32m+[m[32m):[m
+[32m+[m[32m    show_day = date.fromisoformat(show_date)[m
+[32m+[m[32m    as_of_day = date.fromisoformat(as_of_date)[m
+[32m+[m[32m    gross_basis = _key(summary["gross_basis"])[m
+[32m+[m[32m    month_key = show_day.strftime("%Y-%m")[m
+[32m+[m[32m    cumulative_root = ([m
+[32m+[m[32m        f"markets/{market_id}/movies/{movie_id}/cumulative/v1/bases/{gross_basis}"[m
+[32m+[m[32m    )[m
+[32m+[m[32m    month_ref = db.reference(f"{cumulative_root}/months/{month_key}")[m
+[32m+[m[32m    contribution = {[m
+[32m+[m[32m        "run_id": summary["run_id"],[m
+[32m+[m[32m        "observed_at": summary["observed_at"],[m
+[32m+[m[32m        "booked_gross": _number(summary["metrics"].get("booked_gross")),[m
+[32m+[m[32m        "booked_tickets": _number(summary["metrics"].get("booked_tickets")),[m
+[32m+[m[32m        "show_count": int(summary["metrics"].get("show_count") or 0),[m
+[32m+[m[32m    }[m
+[32m+[m[32m    month_metadata = {[m
+[32m+[m[32m        "schema_version": 1,[m
+[32m+[m[32m        "market_id": market_id,[m
+[32m+[m[32m        "movie_id": movie_id,[m
+[32m+[m[32m        "currency": summary["currency"],[m
+[32m+[m[32m        "gross_basis": gross_basis,[m
+[32m+[m[32m        "month": month_key,[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    def update_month(current):[m
+[32m+[m[32m        month = current if isinstance(current, dict) else {}[m
+[32m+[m[32m        dates = dict(month.get("dates") or {})[m
+[32m+[m[32m        previous = dates.get(show_date) or {}[m
+[32m+[m[32m        updated = dict(previous)[m
+[32m+[m[32m        if show_day <= as_of_day:[m
+[32m+[m[32m            previous_current = previous.get("current") or {}[m
+[32m+[m[32m            if ([m
+[32m+[m[32m                not previous_current[m
+[32m+[m[32m                or str(previous_current.get("observed_at", "")) <= contribution["observed_at"][m
+[32m+[m[32m            ):[m
+[32m+[m[32m                if contribution["show_count"]:[m
+[32m+[m[32m                    updated["current"] = contribution[m
+[32m+[m[32m                else:[m
+[32m+[m[32m                    updated.pop("current", None)[m
+[32m+[m[32m            updated.pop("advance", None)[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            updated.pop("current", None)[m
+[32m+[m[32m            if update_advance_snapshot:[m
+[32m+[m[32m                previous_advance = previous.get("advance") or {}[m
+[32m+[m[32m                if ([m
+[32m+[m[32m                    not previous_advance[m
+[32m+[m[32m                    or str(previous_advance.get("observed_at", "")) <= contribution["observed_at"][m
+[32m+[m[32m                ):[m
+[32m+[m[32m                    if contribution["show_count"]:[m
+[32m+[m[32m                        updated["advance"] = contribution[m
+[32m+[m[32m                    else:[m
+[32m+[m[32m                        updated.pop("advance", None)[m
+[32m+[m
+[32m+[m[32m        if updated:[m
+[32m+[m[32m            dates[show_date] = updated[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            dates.pop(show_date, None)[m
+[32m+[m[32m        changed = dates != (month.get("dates") or {})[m
+[32m+[m[32m        return {[m
+[32m+[m[32m            **month_metadata,[m
+[32m+[m[32m            "revision": int(month.get("revision") or 0) + int(changed),[m
+[32m+[m[32m            "updated_at": max([m
+[32m+[m[32m                str(month.get("updated_at") or ""),[m
+[32m+[m[32m                summary["observed_at"],[m
+[32m+[m[32m            ),[m
+[32m+[m[32m            "dates": dates,[m
+[32m+[m[32m            "metrics": _cumulative_metrics(dates, "current"),[m
+[32m+[m[32m            "advance_metrics": _cumulative_metrics(dates, "advance"),[m
+[32m+[m[32m        }[m
+[32m+[m
+[32m+[m[32m    month_value = month_ref.transaction(update_month)[m
+[32m+[m[32m    if not isinstance(month_value, dict):[m
+[32m+[m[32m        raise RuntimeError([m
+[32m+[m[32m            f"Could not read committed cumulative month {month_key} for {movie_id}."[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m    month_metrics = month_value.get("metrics") or {}[m
+[32m+[m[32m    summary_ref = db.reference(f"{cumulative_root}/summary")[m
+[32m+[m[32m    month_rollup = {[m
+[32m+[m[32m        "revision": int(month_value.get("revision") or 0),[m
+[32m+[m[32m        **{[m
+[32m+[m[32m            key: _number(month_metrics.get(key))[m
+[32m+[m[32m            for key in ("booked_gross", "booked_tickets", "show_count")[m
+[32m+[m[32m        },[m
+[32m+[m[32m        "observed_show_dates": int(month_metrics.get("observed_show_dates") or 0),[m
+[32m+[m[32m        "advance_metrics": {[m
+[32m+[m[32m            **{[m
+[32m+[m[32m                key: _number((month_value.get("advance_metrics") or {}).get(key))[m
+[32m+[m[32m                for key in ("booked_gross", "booked_tickets", "show_count")[m
+[32m+[m[32m            },[m
+[32m+[m[32m            "observed_show_dates": int([m
+[32m+[m[32m                (month_value.get("advance_metrics") or {}).get("observed_show_dates") or 0[m
+[32m+[m[32m            ),[m
+[32m+[m[32m        },[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    def update_summary(current):[m
+[32m+[m[32m        cumulative = current if isinstance(current, dict) else {}[m
+[32m+[m[32m        months = dict(cumulative.get("months") or {})[m
+[32m+[m[32m        previous_month = months.get(month_key) or {}[m
+[32m+[m[32m        if month_rollup["revision"] >= int(previous_month.get("revision") or 0):[m
+[32m+[m[32m            months[month_key] = month_rollup[m
+[32m+[m
+[32m+[m[32m        return {[m
+[32m+[m[32m            "schema_version": 1,[m
+[32m+[m[32m            "market_id": market_id,[m
+[32m+[m[32m            "movie_id": movie_id,[m
+[32m+[m[32m            "currency": summary["currency"],[m
+[32m+[m[32m            "gross_basis": gross_basis,[m
+[32m+[m[32m            "aggregation": "latest_observed_daily_snapshots",[m
+[32m+[m[32m            "advance_aggregation": "latest_published_future_date_snapshots",[m
+[32m+[m[32m            "as_of_date": max([m
+[32m+[m[32m                str(cumulative.get("as_of_date") or ""),[m
+[32m+[m[32m                as_of_date,[m
+[32m+[m[32m            ),[m
+[32m+[m[32m            "updated_at": max([m
+[32m+[m[32m                str(cumulative.get("updated_at") or ""),[m
+[32m+[m[32m                summary["observed_at"],[m
+[32m+[m[32m            ),[m
+[32m+[m[32m            "months": months,[m
+[32m+[m[32m            "metrics": {[m
+[32m+[m[32m                key: sum(_number(month.get(key)) for month in months.values())[m
+[32m+[m[32m                for key in ([m
+[32m+[m[32m                    "booked_gross",[m
+[32m+[m[32m                    "booked_tickets",[m
+[32m+[m[32m                    "show_count",[m
+[32m+[m[32m                    "observed_show_dates",[m
+[32m+[m[32m                )[m
+[32m+[m[32m            },[m
+[32m+[m[32m            "advance_metrics": {[m
+[32m+[m[32m                key: sum([m
+[32m+[m[32m                    _number((month.get("advance_metrics") or {}).get(key))[m
+[32m+[m[32m                    for month in months.values()[m
+[32m+[m[32m                )[m
+[32m+[m[32m                for key in ([m
+[32m+[m[32m                    "booked_gross",[m
+[32m+[m[32m                    "booked_tickets",[m
+[32m+[m[32m                    "show_count",[m
+[32m+[m[32m                    "observed_show_dates",[m
+[32m+[m[32m                )[m
+[32m+[m[32m            },[m
+[32m+[m[32m        }[m
+[32m+[m
+[32m+[m[32m    summary_value = summary_ref.transaction(update_summary)[m
+[32m+[m[32m    if not isinstance(summary_value, dict):[m
+[32m+[m[32m        raise RuntimeError(f"Could not commit cumulative summary for {movie_id}.")[m
+[32m+[m[32m    return summary_value[m
+[32m+[m
+[32m+[m
+ def _key(value):[m
+     text = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(value or "unknown").strip().lower())[m
+     return text.strip("-_") or "unknown"[m
+[36m@@ -407,6 +579,7 @@[m [mdef build_analytics_payload([m
+     return {[m
+         "current": {[m
+             "schema_version": 3,[m
+[32m+[m[32m            "gross_basis": "fandango_reported",[m
+             "market_id": market_id,[m
+             "movie_id": movie_id,[m
+             "show_date": show_date,[m
+[36m@@ -494,6 +667,7 @@[m [mdef publish_analytics_payload([m
+     payload,[m
+     update_daily_baseline=False,[m
+     update_advance_snapshot=False,[m
+[32m+[m[32m    as_of_date=None,[m
+ ):[m
+     """Stage summaries and independently fetchable pages before publishing a pointer."""[m
+     root = f"markets/{market_id}/movies/{movie_id}/dates/{show_date}"[m
+[36m@@ -505,10 +679,6 @@[m [mdef publish_analytics_payload([m
+     db.reference([m
+         f"markets/{market_id}/movies/{movie_id}/date_index/{show_date}"[m
+     ).set(True)[m
+[31m-    published_ref = db.reference(f"{root}/published")[m
+[31m-    previous = published_ref.get() or {}[m
+[31m-    previous_run_id = previous.get("active_run_id")[m
+[31m-    previous_advance_run_id = previous.get("advance_run_id")[m
+     run_root = f"{root}/analytics_v2/runs/{run_id}"[m
+     db.reference(f"{run_root}/summary").set(payload["current"])[m
+ [m
+[36m@@ -548,6 +718,10 @@[m [mdef publish_analytics_payload([m
+         })[m
+ [m
+     db.reference(f"{root}/history/{run_id}").set(payload["history_entry"])[m
+[32m+[m[32m    published_ref = db.reference(f"{root}/published")[m
+[32m+[m[32m    previous = published_ref.get() or {}[m
+[32m+[m[32m    previous_run_id = previous.get("active_run_id")[m
+[32m+[m[32m    previous_advance_run_id = previous.get("advance_run_id")[m
+     advance_run_id = run_id if update_advance_snapshot else previous_advance_run_id[m
+     detail_count = len(shows)[m
+     detail_page_count = (detail_count + PAGE_SIZE - 1) // PAGE_SIZE[m
+[36m@@ -590,7 +764,47 @@[m [mdef publish_analytics_payload([m
+         "advance_detail_count": advance_detail_count,[m
+         "advance_detail_page_count": advance_detail_page_count,[m
+     }[m
+[31m-    published_ref.set(published_value)[m
+[32m+[m[32m    _publish_cumulative_snapshot([m
+[32m+[m[32m        db,[m
+[32m+[m[32m        market_id,[m
+[32m+[m[32m        movie_id,[m
+[32m+[m[32m        show_date,[m
+[32m+[m[32m        payload["current"],[m
+[32m+[m[32m        as_of_date or datetime.now(timezone.utc).date().isoformat(),[m
+[32m+[m[32m        update_advance_snapshot,[m
+[32m+[m[32m    )[m
+[32m+[m[32m    summary = payload["current"][m
+[32m+[m[32m    metrics = summary["metrics"][m
+[32m+[m[32m    candidate = None[m
+[32m+[m[32m    if metrics.get("show_count"):[m
+[32m+[m[32m        candidate = {[m
+[32m+[m[32m            "pulse_schema_version": 1,[m
+[32m+[m[32m            "summary_schema_version": summary["schema_version"],[m
+[32m+[m[32m            "market_id": market_id,[m
+[32m+[m[32m            "movie_id": movie_id,[m
+[32m+[m[32m            "movie_name": str(movie_id).replace("-", " ").replace("_", " ").title(),[m
+[32m+[m[32m            "show_date": show_date,[m
+[32m+[m[32m            "run_id": run_id,[m
+[32m+[m[32m            "observed_at": summary["observed_at"],[m
+[32m+[m[32m            "currency": summary["currency"],[m
+[32m+[m[32m            "gross_basis": summary["gross_basis"],[m
+[32m+[m[32m            "booked_gross": metrics["booked_gross"],[m
+[32m+[m[32m            "booked_tickets": metrics["booked_tickets"],[m
+[32m+[m[32m            "show_count": metrics["show_count"],[m
+[32m+[m[32m            "theater_count": metrics["theater_count"],[m
+[32m+[m[32m            "capacity_seats": metrics["capacity_seats"],[m
+[32m+[m[32m            "occupancy_rate": metrics["occupancy_rate"],[m
+[32m+[m[32m        }[m
+[32m+[m
+[32m+[m[32m    market_updates = {[m
+[32m+[m[32m        f"movies/{movie_id}/dates/{show_date}/published": published_value,[m
+[32m+[m[32m        f"pulse/v1/dates/{show_date}/active/{movie_id}": candidate,[m
+[32m+[m[32m    }[m
+[32m+[m[32m    if update_advance_snapshot:[m
+[32m+[m[32m        market_updates[f"pulse/v1/dates/{show_date}/advance/{movie_id}"] = candidate[m
+[32m+[m
+[32m+[m[32m    # Publish the pointer and its market-ranking entries as one commit.[m
+[32m+[m[32m    db.reference(f"markets/{market_id}").update(market_updates)[m
+ [m
+     for old_run_id in {previous_run_id, previous_advance_run_id} - {None, run_id, advance_run_id}:[m
+         db.reference(f"{root}/movie_details/runs/{old_run_id}").delete()[m
+[1mdiff --git a/utils/test_analytics_v2.py b/utils/test_analytics_v2.py[m
+[1mindex ab2da26..fe619aa 100644[m
+[1m--- a/utils/test_analytics_v2.py[m
+[1m+++ b/utils/test_analytics_v2.py[m
+[36m@@ -1,4 +1,5 @@[m
+ import unittest[m
+[32m+[m[32mfrom copy import deepcopy[m
+ [m
+ from utils.analytics_v2 import build_analytics_payload, publish_analytics_payload[m
+ [m
+[36m@@ -32,18 +33,35 @@[m [mclass FakeReference:[m
+         self.database.writes.append(("set", self.path))[m
+ [m
+     def update(self, value):[m
+[31m-        self.database.values.setdefault(self.path, {}).update(value)[m
+[32m+[m[32m        self.database.updates.append((self.path, dict(value)))[m
+[32m+[m[32m        if any("/" in key for key in value):[m
+[32m+[m[32m            for key, child in value.items():[m
+[32m+[m[32m                child_path = f"{self.path}/{key}".strip("/")[m
+[32m+[m[32m                if child is None:[m
+[32m+[m[32m                    self.database.values.pop(child_path, None)[m
+[32m+[m[32m                else:[m
+[32m+[m[32m                    self.database.values[child_path] = child[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            self.database.values.setdefault(self.path, {}).update(value)[m
+         self.database.writes.append(("update", self.path))[m
+ [m
+     def delete(self):[m
+         self.database.values.pop(self.path, None)[m
+         self.database.writes.append(("delete", self.path))[m
+ [m
+[32m+[m[32m    def transaction(self, update_function):[m
+[32m+[m[32m        current = deepcopy(self.database.values.get(self.path))[m
+[32m+[m[32m        updated = update_function(current)[m
+[32m+[m[32m        self.database.values[self.path] = deepcopy(updated)[m
+[32m+[m[32m        self.database.writes.append(("transaction", self.path))[m
+[32m+[m[32m        return deepcopy(updated)[m
+[32m+[m
+ [m
+ class FakeDatabase:[m
+     def __init__(self):[m
+         self.values = {}[m
+         self.writes = [][m
+[32m+[m[32m        self.updates = [][m
+ [m
+     def reference(self, path):[m
+         return FakeReference(self, path)[m
+[36m@@ -455,6 +473,33 @@[m [mclass AnalyticsV2Tests(unittest.TestCase):[m
+         pointer = database.values[f"{root}/published"][m
+         self.assertEqual(pointer["active_run_id"], "active-run")[m
+         self.assertEqual(pointer["advance_run_id"], "advance-run")[m
+[32m+[m[32m        active_pulse = database.values[[m
+[32m+[m[32m            "markets/usa/pulse/v1/dates/2026-10-10/active/example-film"[m
+[32m+[m[32m        ][m
+[32m+[m[32m        advance_pulse = database.values[[m
+[32m+[m[32m            "markets/usa/pulse/v1/dates/2026-10-10/advance/example-film"[m
+[32m+[m[32m        ][m
+[32m+[m[32m        self.assertEqual(active_pulse["run_id"], "active-run")[m
+[32m+[m[32m        self.assertEqual(active_pulse["booked_gross"], 200)[m
+[32m+[m[32m        self.assertEqual(active_pulse["gross_basis"], "fandango_reported")[m
+[32m+[m[32m        self.assertEqual(advance_pulse["run_id"], "advance-run")[m
+[32m+[m[32m        self.assertEqual(advance_pulse["booked_gross"], 100)[m
+[32m+[m[32m        market_updates = [[m
+[32m+[m[32m            updates for path, updates in database.updates if path == "markets/usa"[m
+[32m+[m[32m        ][m
+[32m+[m[32m        self.assertEqual(len(market_updates), 2)[m
+[32m+[m[32m        self.assertIn([m
+[32m+[m[32m            "movies/example-film/dates/2026-10-10/published",[m
+[32m+[m[32m            market_updates[-1],[m
+[32m+[m[32m        )[m
+[32m+[m[32m        self.assertIn([m
+[32m+[m[32m            "pulse/v1/dates/2026-10-10/active/example-film",[m
+[32m+[m[32m            market_updates[-1],[m
+[32m+[m[32m        )[m
+[32m+[m[32m        self.assertNotIn([m
+[32m+[m[32m            "pulse/v1/dates/2026-10-10/advance/example-film",[m
+[32m+[m[32m            market_updates[-1],[m
+[32m+[m[32m        )[m
+         self.assertEqual(pointer["active_detail_count"], 1)[m
+         self.assertEqual(pointer["advance_detail_count"], 1)[m
+         self.assertTrue(pointer["advance_details_available"])[m
+[36m@@ -501,6 +546,162 @@[m [mclass AnalyticsV2Tests(unittest.TestCase):[m
+         self.assertEqual(pointer["advance_detail_count"], 1)[m
+         self.assertEqual(pointer["advance_detail_page_count"], 1)[m
+ [m
+[32m+[m[32m    def test_cumulative_rollup_replaces_corrected_daily_snapshot_idempotently(self):[m
+[32m+[m[32m        database = FakeDatabase()[m
+[32m+[m[32m        first_payload = build_analytics_payload([m
+[32m+[m[32m            [make_show("8:00 PM", 10, 100)],[m
+[32m+[m[32m            market_id="usa",[m
+[32m+[m[32m            movie_id="example-film",[m
+[32m+[m[32m            show_date="2026-10-10",[m
+[32m+[m[32m            run_id="first-run",[m
+[32m+[m[32m        )[m
+[32m+[m[32m        publish_analytics_payload([m
+[32m+[m[32m            database,[m
+[32m+[m[32m            "usa",[m
+[32m+[m[32m            "example-film",[m
+[32m+[m[32m            "2026-10-10",[m
+[32m+[m[32m            first_payload,[m
+[32m+[m[32m            as_of_date="2026-10-12",[m
+[32m+[m[32m        )[m
+[32m+

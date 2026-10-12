@@ -1684,6 +1684,9 @@ if __name__ == "__main__":
                 analytics_payload,
                 update_daily_baseline=OVERWRITE_SNAPSHOT,
                 update_advance_snapshot=not CUMULATIVE_TRACKING_MODE,
+                as_of_date=datetime.now(
+                    pytz.timezone("America/New_York")
+                ).date().isoformat(),
             )
             print("✅ V2 analytics summary and detail pages published.")
 
