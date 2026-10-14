@@ -452,6 +452,13 @@ class AnalyticsV2Tests(unittest.TestCase):
             first_payload,
             update_daily_baseline=True,
             update_advance_snapshot=True,
+            as_of_date="2026-10-09",
+        )
+        self.assertEqual(
+            database.values[
+                "markets/usa/movies/example-film/date_index/2026-10-10"
+            ],
+            {"has_current": False, "has_advance": True},
         )
         second_payload = build_analytics_payload(
             [make_show("8:00 PM", 20, 200)],
@@ -468,11 +475,23 @@ class AnalyticsV2Tests(unittest.TestCase):
             second_payload,
             update_daily_baseline=False,
             update_advance_snapshot=False,
+            as_of_date="2026-10-10",
         )
 
         pointer = database.values[f"{root}/published"]
         self.assertEqual(pointer["active_run_id"], "active-run")
         self.assertEqual(pointer["advance_run_id"], "advance-run")
+        self.assertEqual(
+            database.values[
+                "markets/usa/movies/example-film/date_index/2026-10-10"
+            ],
+            {"has_current": True, "has_advance": True},
+        )
+        same_day_rollup = database.values[
+            "markets/usa/movies/example-film/cumulative/v1/bases/fandango_reported/months/2026-10"
+        ]["dates"]["2026-10-10"]
+        self.assertEqual(same_day_rollup["current"]["booked_gross"], 200)
+        self.assertEqual(same_day_rollup["advance"]["booked_gross"], 100)
         active_pulse = database.values[
             "markets/usa/pulse/v1/dates/2026-10-10/active/example-film"
         ]
@@ -490,6 +509,10 @@ class AnalyticsV2Tests(unittest.TestCase):
         self.assertEqual(len(market_updates), 2)
         self.assertIn(
             "movies/example-film/dates/2026-10-10/published",
+            market_updates[-1],
+        )
+        self.assertIn(
+            "movies/example-film/date_index/2026-10-10",
             market_updates[-1],
         )
         self.assertIn(
@@ -655,9 +678,9 @@ class AnalyticsV2Tests(unittest.TestCase):
             "markets/usa/movies/example-film/cumulative/v1/bases/fandango_reported/months/2026-10"
         ]
         self.assertEqual(summary["metrics"]["booked_gross"], 120)
-        self.assertEqual(summary["advance_metrics"]["booked_gross"], 0)
+        self.assertEqual(summary["advance_metrics"]["booked_gross"], 100)
         self.assertIn("current", month["dates"]["2026-10-15"])
-        self.assertNotIn("advance", month["dates"]["2026-10-15"])
+        self.assertIn("advance", month["dates"]["2026-10-15"])
 
     def test_empty_snapshot_removes_active_and_advance_pulse_candidates(self):
         database = FakeDatabase()
