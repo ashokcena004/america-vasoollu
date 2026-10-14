@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+from collections import defaultdict
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -522,8 +523,16 @@ def _build_global_portal(
     market_portals: dict[str, dict],
     updated_at: str,
     inr_to_usd: float,
+    previous_global_catalog: list[dict] | None = None,
 ) -> dict:
     reconciled = {}
+    artwork_sources = defaultdict(list)
+    previous_catalog = {
+        str(item.get("global_slug")): item
+        for item in (previous_global_catalog or [])
+        if isinstance(item, dict) and item.get("global_slug")
+    }
+    primary_market = next(iter(market_portals), None)
     for market_id, portal in market_portals.items():
         for item in portal.get("movie_catalog", []):
             global_slug = str(item.get("global_slug") or "")
@@ -534,9 +543,6 @@ def _build_global_portal(
                 reconciled[global_slug] = {
                     "global_slug": global_slug,
                     "title": item.get("title") or "",
-                    "poster_url": item.get("poster_url") or "",
-                    "cover_url": item.get("cover_url") or "",
-                    "release_date": item.get("release_date") or "",
                     "last_tracked_date": item.get("last_tracked_date") or "",
                     "global_gross_usd": 0.0,
                     "global_gross_inr": 0.0,
@@ -547,8 +553,9 @@ def _build_global_portal(
                     "market_metrics": {},
                     "markets": [],
                 }
-
             entry = reconciled[global_slug]
+            entry = reconciled[global_slug]
+            artwork_sources[global_slug].append((market_id, item))
             current = _as_dict(item.get("current"))
             advance = _as_dict(item.get("advance"))
             currency = str(item.get("currency") or portal.get("currency") or "USD")
@@ -586,6 +593,23 @@ def _build_global_portal(
             )
             if market_id not in entry["markets"]:
                 entry["markets"].append(market_id)
+
+    for global_slug, entry in reconciled.items():
+        previous = previous_catalog.get(global_slug, {})
+        sources = artwork_sources[global_slug]
+        primary_source = next(
+            (item for market_id, item in sources if market_id == primary_market),
+            {},
+        )
+        for field in ("poster_url", "cover_url", "release_date"):
+            current_value = primary_source.get(field)
+            previous_value = previous.get(field)
+            other_market_value = next(
+                (item.get(field) for market_id, item in sources
+                 if market_id != primary_market and item.get(field)),
+                "",
+            )
+            entry[field] = current_value or previous_value or other_market_value or ""
 
     global_catalog = sorted(
         reconciled.values(),
@@ -672,7 +696,13 @@ def build_portal_views(
     if not market_portals:
         raise RuntimeError("No market portal could be built or reused; global view not written.")
 
-    global_portal = _build_global_portal(market_portals, timestamp, inr_to_usd)
+    previous_global_portal = _as_dict(db.reference("global/portal_view").get())
+    global_portal = _build_global_portal(
+        market_portals,
+        timestamp,
+        inr_to_usd,
+        previous_global_portal.get("global_catalog"),
+    )
     db.reference("global/portal_view").set(global_portal)
     return {
         "markets": market_portals,
