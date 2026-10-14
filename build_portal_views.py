@@ -544,14 +544,27 @@ def _build_global_portal(
                     "global_advance_inr": 0.0,
                     "global_tickets": 0,
                     "global_advance_tickets": 0,
+                    "market_metrics": {},
                     "markets": [],
                 }
 
             entry = reconciled[global_slug]
             current = _as_dict(item.get("current"))
             advance = _as_dict(item.get("advance"))
+            currency = str(item.get("currency") or portal.get("currency") or "USD")
+            market_metrics = entry["market_metrics"].setdefault(
+                market_id,
+                {
+                    "currency": currency,
+                    "current": {"gross": 0.0, "tickets": 0},
+                    "advance": {"gross": 0.0, "tickets": 0},
+                },
+            )
+            market_metrics["current"]["gross"] += _number(current.get("total_gross"))
+            market_metrics["current"]["tickets"] += _integer(current.get("total_tickets"))
+            market_metrics["advance"]["gross"] += _number(advance.get("advance_gross"))
+            market_metrics["advance"]["tickets"] += _integer(advance.get("advance_tickets"))
             try:
-                currency = str(item.get("currency") or portal.get("currency") or "USD")
                 current_gross = _number(current.get("total_gross"))
                 advance_gross = _number(advance.get("advance_gross"))
                 entry["global_gross_usd"] += _usd_amount(current_gross, currency, inr_to_usd)
@@ -598,6 +611,7 @@ def _build_global_portal(
             "global_gross_inr": winner["global_gross_inr"],
             "global_advance_usd": winner["global_advance_usd"],
             "global_advance_inr": winner["global_advance_inr"],
+            "market_metrics": winner["market_metrics"],
             "active_markets": winner["markets"],
         }
 
