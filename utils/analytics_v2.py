@@ -91,7 +91,11 @@ def _publish_cumulative_snapshot(
                     updated["current"] = contribution
                 else:
                     updated.pop("current", None)
-            updated.pop("advance", None)
+            if update_advance_snapshot:
+                if contribution["show_count"]:
+                    updated["advance"] = contribution
+                else:
+                    updated.pop("advance", None)
         else:
             updated.pop("current", None)
             if update_advance_snapshot:
@@ -672,13 +676,14 @@ def publish_analytics_payload(
     """Stage summaries and independently fetchable pages before publishing a pointer."""
     root = f"markets/{market_id}/movies/{movie_id}/dates/{show_date}"
     run_id = payload["current"]["run_id"]
+    effective_as_of_date = date.fromisoformat(
+        as_of_date or datetime.now(timezone.utc).date().isoformat()
+    )
+    show_day = date.fromisoformat(show_date)
     db.reference(f"markets/{market_id}/movie_index/{movie_id}").update({
         "movie_id": movie_id,
         "name": str(movie_id).replace("-", " ").replace("_", " ").title(),
     })
-    db.reference(
-        f"markets/{market_id}/movies/{movie_id}/date_index/{show_date}"
-    ).set(True)
     run_root = f"{root}/analytics_v2/runs/{run_id}"
     db.reference(f"{run_root}/summary").set(payload["current"])
 
@@ -798,6 +803,10 @@ def publish_analytics_payload(
 
     market_updates = {
         f"movies/{movie_id}/dates/{show_date}/published": published_value,
+        f"movies/{movie_id}/date_index/{show_date}": {
+            "has_current": show_day <= effective_as_of_date and bool(run_id),
+            "has_advance": bool(advance_run_id),
+        },
         f"pulse/v1/dates/{show_date}/active/{movie_id}": candidate,
     }
     if update_advance_snapshot:

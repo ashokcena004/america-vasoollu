@@ -31,6 +31,8 @@ from utils.generateFandangoImageReport import generate_fandango_image_report
 SHOW_DATE = "2026-10-14"
 URL = "https://www.fandango.com/jailer-2-247862/movie-overview"
 
+GLOBAL_MOVIE_SLUG = "jailer-2"  # Keep identical in the India scraper for this movie.
+
 # 🚨 FALLBACK & PRICING CONFIGURATION
 AVG_PRICE = 32.00
 MAX_TIER_PRICE = 32.00 #XD D-Box Pricing
@@ -1138,11 +1140,11 @@ if __name__ == "__main__":
             daily_snapshot_observed_at = daily_baseline.get("observed_at")
             last_updated_str = daily_baseline.get("observed_at", "Unknown Time")
             try:
-                ist_tz = timezone(timedelta(hours=5, minutes=30))
+                central_tz = pytz.timezone("America/Chicago")
                 dt_obj = datetime.fromisoformat(
                     last_updated_str.replace("Z", "+00:00")
-                ).astimezone(ist_tz)
-                last_updated_str = dt_obj.strftime("%d %b %Y, %I:%M %p")
+                ).astimezone(central_tz)
+                last_updated_str = dt_obj.strftime("%d %b %Y, %I:%M %p %Z")
             except (TypeError, ValueError):
                 pass
             print(f"📈 Loaded manual daily baseline from {last_updated_str}.")
@@ -1489,8 +1491,8 @@ if __name__ == "__main__":
             if not matching_current:
                 
                 # 1. Figure out local time vs show time
-                state = prev_show.get('state', 'New York')
-                tz_name = STATE_TIMEZONES.get(state, 'America/New_York')
+                state = prev_show.get('state', 'Illinois')
+                tz_name = STATE_TIMEZONES.get(state, 'America/Chicago')
                 
                 try:
                     local_tz = pytz.timezone(tz_name)
@@ -1685,10 +1687,38 @@ if __name__ == "__main__":
                 update_daily_baseline=OVERWRITE_SNAPSHOT,
                 update_advance_snapshot=not CUMULATIVE_TRACKING_MODE,
                 as_of_date=datetime.now(
-                    pytz.timezone("America/New_York")
+                    pytz.timezone("America/Chicago")
                 ).date().isoformat(),
             )
             print("✅ V2 analytics summary and detail pages published.")
+
+            try:
+                db.reference(
+                    f"markets/usa/movies/{MOVIE_SLUG}/meta"
+                ).update({
+                    "title": MOVIE_TITLE,
+                    "global_slug": GLOBAL_MOVIE_SLUG.strip(),
+                })
+                db.reference(
+                    f"markets/usa/movie_index/{MOVIE_SLUG}"
+                ).update({
+                    "movie_id": MOVIE_SLUG,
+                    "name": MOVIE_TITLE,
+                    "global_slug": GLOBAL_MOVIE_SLUG.strip(),
+                })
+
+                from build_portal_views import run_portal_views
+
+                exchange_rate = float(os.environ["INR_TO_USD"])
+                run_portal_views(
+                    market_ids=("usa",),
+                    inr_to_usd=exchange_rate,
+                    db_instance=db,
+                )
+                print("✅ USA and global portal views rebuilt.")
+            except Exception:
+                logging.exception("Automatic USA/global portal refresh failed.")
+                raise
 
         pipeline_elapsed = time.time() - PIPELINE_START_TIME
         mins, secs = divmod(pipeline_elapsed, 60)
