@@ -59,7 +59,6 @@ EXTRA_GROSS_NOTE = "Added extra gross for offline fans sold-out shows - Cineloun
 
 MAPPING_FILE = "state_theatre_mapping.json"
 OVERWRITE_SNAPSHOT = os.getenv("OVERWRITE_SNAPSHOT", "false").lower() == "true" # ⚠️ Set to True to update the baseline after this run
-CUMULATIVE_TRACKING_MODE = False
 
 SEAT_COUNT_MODE = 1
 # 1 = Use physical seat map count when available (more accurate but slower)
@@ -837,7 +836,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                             for p in prices_seen: 
                                 if p > 0: local_knowledge_base[kb_key]['prices'].add(p)
 
-                        if CUMULATIVE_TRACKING_MODE and has_available_failed_tiers:
+                        if has_available_failed_tiers:
                             final_status = "Available (Map Error)"
                         else:
                             final_status = "Sold Out" if combined_booked >= combined_total and combined_total > 0 else "Available"
@@ -1422,7 +1421,7 @@ if __name__ == "__main__":
     # =========================================================================
     # ── 4.8 CUMULATIVE TRACKING MODE (RESCUE PASSED SHOWS & PATCH ERRORS) ────
     # =========================================================================
-    if CUMULATIVE_TRACKING_MODE and recent_shows_data:
+    if recent_shows_data:
         print(f"\n🛡️ Activating Cumulative Tracking Mode: Rescuing dropped shows and patching API errors...")
         
         # Dictionary mapping exact JSON State keys to their primary timezone
@@ -1663,6 +1662,8 @@ if __name__ == "__main__":
                 except Exception as e:
                     print(f"⚠️ Failed to update Hash Cache: {e}")
 
+            us_today = datetime.now(pytz.timezone("America/Chicago")).date()
+            show_date = datetime.strptime(SHOW_DATE, "%Y-%m-%d").date()
             run_timestamp = datetime.now(timezone.utc)
             analytics_payload = build_analytics_payload(
                 master_shows_data,
@@ -1685,10 +1686,8 @@ if __name__ == "__main__":
                 SHOW_DATE,
                 analytics_payload,
                 update_daily_baseline=OVERWRITE_SNAPSHOT,
-                update_advance_snapshot=not CUMULATIVE_TRACKING_MODE,
-                as_of_date=datetime.now(
-                    pytz.timezone("America/Chicago")
-                ).date().isoformat(),
+                update_advance_snapshot=show_date > us_today,
+                as_of_date=us_today.isoformat(),
             )
             print("✅ V2 analytics summary and detail pages published.")
 

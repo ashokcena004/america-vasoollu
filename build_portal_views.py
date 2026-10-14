@@ -225,6 +225,88 @@ def _scope_totals(
     return totals
 
 
+def _has_authoritative_sales(contribution: Any) -> bool:
+    metrics = _as_dict(contribution)
+    return (
+        _number(metrics.get("booked_gross")) > 0
+        or _number(metrics.get("booked_tickets")) > 0
+    )
+
+
+def _lifecycle_rollup(rollup_dates: dict, as_of_date: date) -> dict:
+    totals = {
+        "total_gross_so_far": 0.0,
+        "total_tickets_so_far": 0,
+        "total_shows_so_far": 0,
+        "advance_sales_from_tomorrow": 0.0,
+        "advance_tickets_from_tomorrow": 0,
+        "advance_shows_from_tomorrow": 0,
+    }
+    valid_dates = []
+
+    for show_date, raw_entry in rollup_dates.items():
+        day = _date_value(show_date)
+        if day is None:
+            continue
+        entry = _as_dict(raw_entry)
+        current = _as_dict(entry.get("current"))
+        advance = _as_dict(entry.get("advance"))
+        current_valid = _has_authoritative_sales(current)
+        advance_valid = _has_authoritative_sales(advance)
+        if current_valid or advance_valid:
+            valid_dates.append(day)
+
+        if day < as_of_date:
+            selected = current if current_valid else {}
+            total_prefix = "total"
+        elif day == as_of_date:
+            selected = current if current_valid else (advance if advance_valid else {})
+            total_prefix = "total"
+        else:
+            selected = advance if advance_valid else {}
+            total_prefix = "advance"
+
+        if not selected:
+            continue
+        totals[f"{total_prefix}_gross_so_far" if total_prefix == "total" else "advance_sales_from_tomorrow"] += _number(
+            selected.get("booked_gross")
+        )
+        totals[
+            "total_tickets_so_far"
+            if total_prefix == "total"
+            else "advance_tickets_from_tomorrow"
+        ] += _integer(selected.get("booked_tickets"))
+        totals[
+            "total_shows_so_far"
+            if total_prefix == "total"
+            else "advance_shows_from_tomorrow"
+        ] += _integer(selected.get("show_count"))
+
+    if not valid_dates:
+        status = "unknown"
+        first_valid_date = ""
+        last_valid_date = ""
+    else:
+        first_day = min(valid_dates)
+        last_day = max(valid_dates)
+        first_valid_date = first_day.isoformat()
+        last_valid_date = last_day.isoformat()
+        if first_day > as_of_date:
+            status = "coming_soon"
+        elif last_day < as_of_date:
+            status = "archived"
+        else:
+            status = "playing_now"
+
+    return {
+        **totals,
+        "status": status,
+        "valid_dates": sorted(day.isoformat() for day in set(valid_dates)),
+        "first_valid_show_date": first_valid_date,
+        "last_valid_show_date": last_valid_date,
+    }
+
+
 def _occupancy_rollup(summaries: dict[str, dict]) -> float:
     total_tickets = 0.0
     total_capacity = 0.0
@@ -316,7 +398,23 @@ def _movie_documents(
 ) -> tuple[dict, dict]:
     root = f"markets/{market_id}/movies/{movie_id}"
     metadata = _as_dict(db.reference(f"{root}/meta").get())
-    date_index = _as_dict(db.reference(f"{root}/date_index").get())
+    raw_date_index = _as_dict(db.reference(f"{root}/date_index").get())
+    date_index = {}
+    for show_date, raw_availability in raw_date_index.items():
+        day = _date_value(show_date)
+        availability = _as_dict(raw_availability)
+        if day is None:
+            date_index[show_date] = availability
+            continue
+        date_index[show_date] = {
+            **availability,
+            "has_current": (
+                day <= as_of_date and bool(availability.get("has_current"))
+            ),
+            "has_advance": (
+                day > as_of_date and bool(availability.get("has_advance"))
+            ),
+        }
     cumulative = _as_dict(db.reference(f"{root}/cumulative/v1/bases").get())
     basis, basis_data = _choose_basis(cumulative, market_id, metadata, movie_index)
     months = _as_dict(basis_data.get("months"))
@@ -327,6 +425,7 @@ def _movie_documents(
     for month in months.values():
         rollup_dates.update(_as_dict(_as_dict(month).get("dates")))
 
+    lifecycle = _lifecycle_rollup(rollup_dates, as_of_date)
     current_totals = _scope_totals(rollup_dates, date_index, "current", as_of_date)
     advance_totals = _scope_totals(rollup_dates, date_index, "advance", as_of_date)
     current_summaries, advance_summaries = _read_date_summaries(
@@ -351,18 +450,13 @@ def _movie_documents(
         or _slug(title)
         or _slug(movie_id)
     )
-    tracked_dates = [
-        show_date
-        for show_date, entry in rollup_dates.items()
-        if _as_dict(entry).get("current") or _as_dict(entry).get("advance")
-    ]
     meta = {
         "title": title,
         "global_slug": global_slug,
         "poster_url": metadata.get("poster_url") or movie_index.get("poster_url") or "",
         "cover_url": metadata.get("cover_url") or movie_index.get("cover_url") or "",
         "release_date": metadata.get("release_date") or movie_index.get("release_date") or "",
-        "last_tracked_date": max(tracked_dates, default=""),
+        "last_tracked_date": lifecycle["last_valid_show_date"],
     }
     currency = str(
         metadata.get("currency")
@@ -398,11 +492,21 @@ def _movie_documents(
     }
 
     summary_view = {
-        "schema_version": 1,
+        "schema_version": 2,
         "market_id": market_id,
         "movie_id": movie_id,
         "currency": currency,
         "updated_at": updated_at,
+        "status": lifecycle["status"],
+        "as_of_date": as_of_date.isoformat(),
+        "first_valid_show_date": lifecycle["first_valid_show_date"],
+        "last_valid_show_date": lifecycle["last_valid_show_date"],
+        "total_gross_so_far": lifecycle["total_gross_so_far"],
+        "total_tickets_so_far": lifecycle["total_tickets_so_far"],
+        "total_shows_so_far": lifecycle["total_shows_so_far"],
+        "advance_sales_from_tomorrow": lifecycle["advance_sales_from_tomorrow"],
+        "advance_tickets_from_tomorrow": lifecycle["advance_tickets_from_tomorrow"],
+        "advance_shows_from_tomorrow": lifecycle["advance_shows_from_tomorrow"],
         "meta": meta,
         "date_index": date_index,
         "lifetime_kpis": {
@@ -426,6 +530,15 @@ def _movie_documents(
     catalog_item = {
         "movie_id": movie_id,
         **meta,
+        "status": lifecycle["status"],
+        "as_of_date": as_of_date.isoformat(),
+        "first_valid_show_date": lifecycle["first_valid_show_date"],
+        "total_gross_so_far": lifecycle["total_gross_so_far"],
+        "total_tickets_so_far": lifecycle["total_tickets_so_far"],
+        "total_shows_so_far": lifecycle["total_shows_so_far"],
+        "advance_sales_from_tomorrow": lifecycle["advance_sales_from_tomorrow"],
+        "advance_tickets_from_tomorrow": lifecycle["advance_tickets_from_tomorrow"],
+        "advance_shows_from_tomorrow": lifecycle["advance_shows_from_tomorrow"],
         "currency": currency,
         "current": current,
         "advance": advance,
@@ -440,6 +553,32 @@ def _ranked(items: list[dict], sales_scope: str) -> list[dict]:
         key=lambda item: (
             -_number(_as_dict(item.get(sales_scope)).get(gross_key)),
             str(item.get("movie_id", "")),
+        ),
+    )[:10]
+
+
+def _ranked_lifecycle(
+    items: list[dict],
+    status: str,
+    gross_key: str,
+    tickets_key: str,
+    id_key: str,
+) -> list[dict]:
+    eligible = [
+        item
+        for item in items
+        if item.get("status") == status
+        and (
+            _number(item.get(gross_key)) > 0
+            or _integer(item.get(tickets_key)) > 0
+        )
+    ]
+    return sorted(
+        eligible,
+        key=lambda item: (
+            -_number(item.get(gross_key)),
+            -_integer(item.get(tickets_key)),
+            str(item.get(id_key, "")),
         ),
     )[:10]
 
@@ -491,11 +630,25 @@ def _build_market_portal(
         else MARKET_CURRENCY.get(market_id.lower(), "USD")
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "market_id": market_id,
         "currency": currency,
         "updated_at": updated_at,
         "movie_catalog": catalog,
+        "top10_playing_now": _ranked_lifecycle(
+            catalog,
+            "playing_now",
+            "total_gross_so_far",
+            "total_tickets_so_far",
+            "movie_id",
+        ),
+        "top10_coming_soon": _ranked_lifecycle(
+            catalog,
+            "coming_soon",
+            "advance_sales_from_tomorrow",
+            "advance_tickets_from_tomorrow",
+            "movie_id",
+        ),
         "top10_current": _ranked(catalog, "current"),
         "top10_advance": _ranked(catalog, "advance"),
     }
@@ -550,10 +703,19 @@ def _build_global_portal(
                     "global_advance_inr": 0.0,
                     "global_tickets": 0,
                     "global_advance_tickets": 0,
+                    "global_total_gross_so_far_usd": 0.0,
+                    "global_total_gross_so_far_inr": 0.0,
+                    "global_advance_sales_from_tomorrow_usd": 0.0,
+                    "global_advance_sales_from_tomorrow_inr": 0.0,
+                    "global_tickets_so_far": 0,
+                    "global_advance_tickets_from_tomorrow": 0,
+                    "global_shows_so_far": 0,
+                    "global_advance_shows_from_tomorrow": 0,
+                    "status": "unknown",
+                    "market_statuses": {},
                     "market_metrics": {},
                     "markets": [],
                 }
-            entry = reconciled[global_slug]
             entry = reconciled[global_slug]
             artwork_sources[global_slug].append((market_id, item))
             current = _as_dict(item.get("current"))
@@ -565,8 +727,45 @@ def _build_global_portal(
                     "currency": currency,
                     "current": {"gross": 0.0, "tickets": 0},
                     "advance": {"gross": 0.0, "tickets": 0},
+                    "status": "unknown",
+                    "total_gross_so_far": 0.0,
+                    "tickets_so_far": 0,
+                    "advance_sales_from_tomorrow": 0.0,
+                    "advance_tickets_from_tomorrow": 0,
+                    "total_shows_so_far": 0,
+                    "advance_shows_from_tomorrow": 0,
                 },
             )
+            market_metrics["status"] = item.get("status", "unknown")
+            market_metrics["total_gross_so_far"] += _number(
+                item.get("total_gross_so_far")
+            )
+            market_metrics["tickets_so_far"] += _integer(
+                item.get("total_tickets_so_far")
+            )
+            market_metrics["advance_sales_from_tomorrow"] += _number(
+                item.get("advance_sales_from_tomorrow")
+            )
+            market_metrics["advance_tickets_from_tomorrow"] += _integer(
+                item.get("advance_tickets_from_tomorrow")
+            )
+            market_metrics["total_shows_so_far"] += _integer(
+                item.get("total_shows_so_far")
+            )
+            market_metrics["advance_shows_from_tomorrow"] += _integer(
+                item.get("advance_shows_from_tomorrow")
+            )
+            entry["market_statuses"][market_id] = item.get("status", "unknown")
+            status_priority = {
+                "playing_now": 3,
+                "coming_soon": 2,
+                "archived": 1,
+                "unknown": 0,
+            }
+            if status_priority.get(item.get("status"), 0) > status_priority.get(
+                entry["status"], 0
+            ):
+                entry["status"] = item.get("status", "unknown")
             market_metrics["current"]["gross"] += _number(current.get("total_gross"))
             market_metrics["current"]["tickets"] += _integer(current.get("total_tickets"))
             market_metrics["advance"]["gross"] += _number(advance.get("advance_gross"))
@@ -574,10 +773,26 @@ def _build_global_portal(
             try:
                 current_gross = _number(current.get("total_gross"))
                 advance_gross = _number(advance.get("advance_gross"))
+                total_gross_so_far = _number(item.get("total_gross_so_far"))
+                advance_from_tomorrow = _number(
+                    item.get("advance_sales_from_tomorrow")
+                )
                 entry["global_gross_usd"] += _usd_amount(current_gross, currency, inr_to_usd)
                 entry["global_gross_inr"] += _inr_amount(current_gross, currency, inr_to_usd)
                 entry["global_advance_usd"] += _usd_amount(advance_gross, currency, inr_to_usd)
                 entry["global_advance_inr"] += _inr_amount(advance_gross, currency, inr_to_usd)
+                entry["global_total_gross_so_far_usd"] += _usd_amount(
+                    total_gross_so_far, currency, inr_to_usd
+                )
+                entry["global_total_gross_so_far_inr"] += _inr_amount(
+                    total_gross_so_far, currency, inr_to_usd
+                )
+                entry["global_advance_sales_from_tomorrow_usd"] += _usd_amount(
+                    advance_from_tomorrow, currency, inr_to_usd
+                )
+                entry["global_advance_sales_from_tomorrow_inr"] += _inr_amount(
+                    advance_from_tomorrow, currency, inr_to_usd
+                )
             except ValueError:
                 LOGGER.exception(
                     "Skipping currency conversion for %s/%s with currency %s.",
@@ -587,6 +802,16 @@ def _build_global_portal(
                 )
             entry["global_tickets"] += _integer(current.get("total_tickets"))
             entry["global_advance_tickets"] += _integer(advance.get("advance_tickets"))
+            entry["global_tickets_so_far"] += _integer(
+                item.get("total_tickets_so_far")
+            )
+            entry["global_advance_tickets_from_tomorrow"] += _integer(
+                item.get("advance_tickets_from_tomorrow")
+            )
+            entry["global_shows_so_far"] += _integer(item.get("total_shows_so_far"))
+            entry["global_advance_shows_from_tomorrow"] += _integer(
+                item.get("advance_shows_from_tomorrow")
+            )
             entry["last_tracked_date"] = max(
                 str(entry["last_tracked_date"]),
                 str(item.get("last_tracked_date") or ""),
@@ -639,8 +864,26 @@ def _build_global_portal(
             "active_markets": winner["markets"],
         }
 
+    top10_playing_now = _ranked_lifecycle(
+        global_catalog,
+        "playing_now",
+        "global_total_gross_so_far_usd",
+        "global_tickets_so_far",
+        "global_slug",
+    )
+    top10_coming_soon = _ranked_lifecycle(
+        global_catalog,
+        "coming_soon",
+        "global_advance_sales_from_tomorrow_usd",
+        "global_advance_tickets_from_tomorrow",
+        "global_slug",
+    )
+
+    def lifecycle_spotlight(items: list[dict]) -> dict | None:
+        return dict(items[0]) if items else None
+
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "updated_at": updated_at,
         "meta_exchange_rates": {
             "base_currency": "USD",
@@ -651,6 +894,10 @@ def _build_global_portal(
         "top_spotlight_advance": spotlight(
             "global_advance_usd", "global_advance_tickets"
         ),
+        "top10_playing_now": top10_playing_now,
+        "top10_coming_soon": top10_coming_soon,
+        "top_spotlight_playing_now": lifecycle_spotlight(top10_playing_now),
+        "top_spotlight_coming_soon": lifecycle_spotlight(top10_coming_soon),
         "global_catalog": global_catalog,
     }
 
