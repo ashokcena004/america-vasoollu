@@ -49,6 +49,7 @@ jobs:
         env:
           FIREBASE_CREDENTIALS: ${{ secrets.FIREBASE_CREDENTIALS }}
           FIREBASE_DATABASE_URL: https://wkndcinema-default-rtdb.asia-southeast1.firebasedatabase.app
+          INR_TO_USD: ${{ secrets.INR_TO_USD }}
           OVERWRITE_SNAPSHOT: "true"
           PLAYWRIGHT_BROWSER_TRACKING: "1"
         run: |

@@ -1707,9 +1707,18 @@ if __name__ == "__main__":
                     "global_slug": GLOBAL_MOVIE_SLUG.strip(),
                 })
 
-                from build_portal_views import run_portal_views
+                from build_portal_views import DEFAULT_INR_TO_USD, run_portal_views
 
-                exchange_rate = float(os.environ["INR_TO_USD"])
+                exchange_rate_setting = os.environ.get("INR_TO_USD", "").strip()
+                if exchange_rate_setting:
+                    exchange_rate = float(exchange_rate_setting)
+                else:
+                    exchange_rate = DEFAULT_INR_TO_USD
+                    logging.warning(
+                        "INR_TO_USD is not configured; using the portal builder's "
+                        "default rate of %.4f.",
+                        exchange_rate,
+                    )
                 run_portal_views(
                     market_ids=("usa",),
                     inr_to_usd=exchange_rate,
