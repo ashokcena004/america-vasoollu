@@ -14,6 +14,7 @@ import pytz
 
 LOGGER = logging.getLogger("build_portal_views")
 DEFAULT_MARKETS = ("india", "usa")
+DEFAULT_INR_TO_USD = 0.0118
 PREFERRED_GROSS_BASIS = {
     "india": "bms",
     "usa": "fandango_reported",
@@ -621,7 +622,7 @@ def build_portal_views(
     market_ids: tuple[str, ...] = DEFAULT_MARKETS,
     as_of_date: str | date | None = None,
     updated_at: str | None = None,
-    inr_to_usd: float = 0.0118,
+    inr_to_usd: float = DEFAULT_INR_TO_USD,
 ) -> dict:
     """Build portal documents using only rollups, published pointers, and summaries."""
     if inr_to_usd <= 0:
