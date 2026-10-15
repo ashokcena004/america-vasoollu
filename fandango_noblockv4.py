@@ -28,7 +28,7 @@ from utils.generateFandangoImageReport import generate_fandango_image_report
 # ── 1. CONFIGURATION ─────────────────────────────────────────────────────────
 # =============================================================================
 
-SHOW_DATE = "2026-10-14"
+SHOW_DATE = "2026-10-15"
 URL = "https://www.fandango.com/jailer-2-247862/movie-overview"
 
 GLOBAL_MOVIE_SLUG = "jailer-2"  # Keep identical in the India scraper for this movie.
