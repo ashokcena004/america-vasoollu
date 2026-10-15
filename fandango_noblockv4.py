@@ -55,6 +55,8 @@ MANUAL_SHOWS = [
     # ["EXTRA", "", "", 16500.0, 0, 560] # Cinelounge Fremont Fans Show
 ]
 
+FORCE_UPDATE_ADVANCE = True
+
 EXTRA_GROSS_NOTE = "Added extra gross for offline fans sold-out shows - Cinelounge Fremont 7 CA."
 
 MAPPING_FILE = "state_theatre_mapping.json"
@@ -1686,7 +1688,7 @@ if __name__ == "__main__":
                 SHOW_DATE,
                 analytics_payload,
                 update_daily_baseline=OVERWRITE_SNAPSHOT,
-                update_advance_snapshot=show_date > us_today,
+                update_advance_snapshot=show_date > us_today or FORCE_UPDATE_ADVANCE,
                 as_of_date=us_today.isoformat(),
             )
             print("✅ V2 analytics summary and detail pages published.")
