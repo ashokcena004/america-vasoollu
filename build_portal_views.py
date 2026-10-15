@@ -121,9 +121,10 @@ def _read_date_summaries(
     rollup_dates: dict,
     date_index: dict,
     as_of_date: date,
-) -> tuple[dict[str, dict], dict[str, dict]]:
+) -> tuple[dict[str, dict], dict[str, dict], set[str]]:
     current_summaries = {}
     advance_summaries = {}
+    estimated_current_dates = set()
 
     for show_date in sorted(rollup_dates):
         day = _date_value(show_date)
@@ -132,27 +133,48 @@ def _read_date_summaries(
             continue
 
         rollup = _as_dict(rollup_dates[show_date])
-
+        current_contribution = _as_dict(rollup.get("current"))
+        advance_contribution = _as_dict(rollup.get("advance"))
         published = _as_dict(
             db.reference(
                 f"markets/{market_id}/movies/{movie_id}/dates/{show_date}/published"
             ).get()
         )
+        availability = _as_dict(date_index.get(show_date))
+        has_active_run = bool(
+            availability.get("has_current") or published.get("active_run_id")
+        )
+        use_advance_for_current = (
+            day <= as_of_date
+            and not has_active_run
+            and _has_authoritative_sales(advance_contribution)
+        )
+
         if (
             day <= as_of_date
-            and _scope_available(date_index, show_date, "current", day, as_of_date)
-            and isinstance(rollup.get("current"), dict)
+            and (
+                use_advance_for_current
+                or (
+                    _scope_available(date_index, show_date, "current", day, as_of_date)
+                    and isinstance(rollup.get("current"), dict)
+                )
+            )
         ):
-            run_id = published.get("active_run_id")
+            run_id = published.get(
+                "advance_run_id" if use_advance_for_current else "active_run_id"
+            )
             if run_id:
                 summary = _as_dict(
                     _summary_reference(db, market_id, movie_id, show_date, str(run_id)).get()
                 )
                 if summary:
                     current_summaries[show_date] = summary
+                    if use_advance_for_current:
+                        estimated_current_dates.add(show_date)
                 else:
                     LOGGER.warning(
-                        "Missing active analytics summary for %s/%s/%s run %s.",
+                        "Missing %s analytics summary for %s/%s/%s run %s.",
+                        "advance" if use_advance_for_current else "active",
                         market_id,
                         movie_id,
                         show_date,
@@ -160,7 +182,8 @@ def _read_date_summaries(
                     )
             else:
                 LOGGER.warning(
-                    "Missing active run pointer for %s/%s/%s.",
+                    "Missing %s run pointer for %s/%s/%s.",
+                    "advance" if use_advance_for_current else "active",
                     market_id,
                     movie_id,
                     show_date,
@@ -193,7 +216,7 @@ def _read_date_summaries(
                     show_date,
                 )
 
-    return current_summaries, advance_summaries
+    return current_summaries, advance_summaries, estimated_current_dates
 
 
 def _delta(metrics: dict, public_key: str, legacy_key: str) -> float:
@@ -214,11 +237,21 @@ def _scope_totals(
         day = _date_value(show_date)
         if day is None:
             continue
-        if scope == "current" and day > as_of_date:
+        entry = _as_dict(entry)
+        if scope == "current":
+            if day > as_of_date:
+                continue
+            if not _scope_available(date_index, show_date, scope, day, as_of_date):
+                continue
+            contribution = _current_contribution(entry, date_index, show_date)
+        else:
+            if day <= as_of_date:
+                continue
+            if not _scope_available(date_index, show_date, scope, day, as_of_date):
+                continue
+            contribution = _as_dict(entry.get(scope))
+        if not contribution:
             continue
-        if not _scope_available(date_index, show_date, scope, day, as_of_date):
-            continue
-        contribution = _as_dict(_as_dict(entry).get(scope))
         totals["gross"] += _number(contribution.get("booked_gross"))
         totals["tickets"] += _integer(contribution.get("booked_tickets"))
         totals["shows"] += _integer(contribution.get("show_count"))
@@ -233,7 +266,11 @@ def _has_authoritative_sales(contribution: Any) -> bool:
     )
 
 
-def _lifecycle_rollup(rollup_dates: dict, as_of_date: date) -> dict:
+def _lifecycle_rollup(
+    rollup_dates: dict,
+    as_of_date: date,
+    date_index: dict | None = None,
+) -> dict:
     totals = {
         "total_gross_so_far": 0.0,
         "total_tickets_so_far": 0,
@@ -256,11 +293,13 @@ def _lifecycle_rollup(rollup_dates: dict, as_of_date: date) -> dict:
         if current_valid or advance_valid:
             valid_dates.append(day)
 
-        if day < as_of_date:
-            selected = current if current_valid else {}
-            total_prefix = "total"
-        elif day == as_of_date:
-            selected = current if current_valid else (advance if advance_valid else {})
+        if day <= as_of_date:
+            if date_index is None:
+                selected = current if current_valid else (advance if advance_valid else {})
+            elif _scope_available(date_index, show_date, "current", day, as_of_date):
+                selected = _current_contribution(entry, date_index, show_date)
+            else:
+                selected = {}
             total_prefix = "total"
         else:
             selected = advance if advance_valid else {}
@@ -347,10 +386,23 @@ def _scope_available(
     as_of_date: date,
 ) -> bool:
     entry = _as_dict(date_index.get(show_date))
+    if scope == "current" and show_day > as_of_date:
+        return False
     key = f"has_{scope}"
     if key in entry:
+        if scope == "current":
+            return bool(entry[key] or entry.get("has_advance"))
         return bool(entry[key])
     return show_day <= as_of_date if scope == "current" else show_day > as_of_date
+
+
+def _current_contribution(entry: dict, date_index: dict, show_date: str) -> dict:
+    current = _as_dict(entry.get("current"))
+    availability = _as_dict(date_index.get(show_date))
+    has_active_run = availability.get("has_current")
+    if has_active_run is None:
+        has_active_run = bool(current)
+    return current if has_active_run else _as_dict(entry.get("advance"))
 
 
 def _build_trajectory(
@@ -368,7 +420,12 @@ def _build_trajectory(
             continue
         if not _scope_available(date_index, show_date, scope, day, as_of_date):
             continue
-        contribution = _as_dict(_as_dict(rollup_dates[show_date]).get(scope))
+        rollup = _as_dict(rollup_dates[show_date])
+        contribution = (
+            _current_contribution(rollup, date_index, show_date)
+            if scope == "current"
+            else _as_dict(rollup.get(scope))
+        )
         if not contribution:
             continue
 
@@ -380,6 +437,8 @@ def _build_trajectory(
             "daily_gross": daily_gross,
             "cumulative_gross": cumulative_gross,
             "tickets": _integer(contribution.get("booked_tickets")),
+            "shows": _integer(contribution.get("show_count")),
+            "capacity_seats": _integer(metrics.get("capacity_seats")),
             "occupancy": _occupancy(metrics),
         }
         if scope == "advance":
@@ -399,6 +458,7 @@ def _movie_documents(
     root = f"markets/{market_id}/movies/{movie_id}"
     metadata = _as_dict(db.reference(f"{root}/meta").get())
     raw_date_index = _as_dict(db.reference(f"{root}/date_index").get())
+    source_date_index = raw_date_index
     date_index = {}
     for show_date, raw_availability in raw_date_index.items():
         day = _date_value(show_date)
@@ -409,10 +469,12 @@ def _movie_documents(
         date_index[show_date] = {
             **availability,
             "has_current": (
-                day <= as_of_date and bool(availability.get("has_current"))
+                day <= as_of_date and bool(
+                    availability.get("has_current") or availability.get("has_advance")
+                )
             ),
             "has_advance": (
-                day > as_of_date and bool(availability.get("has_advance"))
+                bool(availability.get("has_advance"))
             ),
         }
     cumulative = _as_dict(db.reference(f"{root}/cumulative/v1/bases").get())
@@ -425,17 +487,29 @@ def _movie_documents(
     for month in months.values():
         rollup_dates.update(_as_dict(_as_dict(month).get("dates")))
 
-    lifecycle = _lifecycle_rollup(rollup_dates, as_of_date)
-    current_totals = _scope_totals(rollup_dates, date_index, "current", as_of_date)
-    advance_totals = _scope_totals(rollup_dates, date_index, "advance", as_of_date)
-    current_summaries, advance_summaries = _read_date_summaries(
+    lifecycle = _lifecycle_rollup(rollup_dates, as_of_date, source_date_index)
+    current_totals = _scope_totals(
+        rollup_dates,
+        source_date_index,
+        "current",
+        as_of_date,
+    )
+    advance_totals = _scope_totals(
+        rollup_dates, source_date_index, "advance", as_of_date
+    )
+    current_summaries, advance_summaries, estimated_current_dates = _read_date_summaries(
         db,
         market_id,
         movie_id,
         rollup_dates,
-        date_index,
+        source_date_index,
         as_of_date,
     )
+    future_advance_summaries = {
+        show_date: summary
+        for show_date, summary in advance_summaries.items()
+        if (_date_value(show_date) or as_of_date) > as_of_date
+    }
 
     title = str(
         metadata.get("title")
@@ -465,12 +539,13 @@ def _movie_documents(
         or MARKET_CURRENCY.get(market_id.lower(), "USD")
     )
     latest_current = _latest_metrics(current_summaries)
-    latest_advance = _latest_metrics(advance_summaries)
+    latest_advance = _latest_metrics(future_advance_summaries)
     current = {
         "total_gross": current_totals["gross"],
         "total_tickets": current_totals["tickets"],
         "total_shows": current_totals["shows"],
         "avg_occupancy": _occupancy_rollup(current_summaries),
+        "avg_occupancy_is_estimate": bool(estimated_current_dates),
         "fast_fillings": _integer(latest_current.get("fast_fillings")),
         "sold_outs": _integer(latest_current.get("sold_outs")),
         "gross_delta": _delta(latest_current, "gross_delta", "booked_gross"),
@@ -482,7 +557,7 @@ def _movie_documents(
         "advance_gross": advance_totals["gross"],
         "advance_tickets": advance_totals["tickets"],
         "advance_shows": advance_totals["shows"],
-        "avg_occupancy": _occupancy_rollup(advance_summaries),
+        "avg_occupancy": _occupancy_rollup(future_advance_summaries),
         "fast_fillings": _integer(latest_advance.get("fast_fillings")),
         "sold_outs": _integer(latest_advance.get("sold_outs")),
         "gross_delta": _delta(latest_advance, "gross_delta", "booked_gross"),
@@ -517,13 +592,13 @@ def _movie_documents(
             "advance_gross": advance_totals["gross"],
             "advance_tickets": advance_totals["tickets"],
             "advance_shows": advance_totals["shows"],
-            "advance_avg_occupancy": _occupancy_rollup(advance_summaries),
+            "advance_avg_occupancy": _occupancy_rollup(future_advance_summaries),
         },
         "daily_trajectory_current": _build_trajectory(
-            rollup_dates, current_summaries, date_index, "current", as_of_date
+            rollup_dates, current_summaries, source_date_index, "current", as_of_date
         ),
         "daily_trajectory_advance": _build_trajectory(
-            rollup_dates, advance_summaries, date_index, "advance", as_of_date
+            rollup_dates, advance_summaries, source_date_index, "advance", as_of_date
         ),
         "gross_basis": basis,
     }
@@ -925,6 +1000,21 @@ def build_portal_views(
             portal = _build_market_portal(db, market_id, effective_date, timestamp)
             db.reference(f"{market_root}/portal_view").set(portal)
             market_portals[market_id] = portal
+            LOGGER.info(
+                "Published %s market portal: %d movies, %d playing now, %d coming soon, %d provisional occupancy values.",
+                market_id,
+                len(portal["movie_catalog"]),
+                len(portal["top10_playing_now"]),
+                len(portal["top10_coming_soon"]),
+                sum(
+                    bool(
+                        _as_dict(item.get("current")).get(
+                            "avg_occupancy_is_estimate"
+                        )
+                    )
+                    for item in portal["movie_catalog"]
+                ),
+            )
         except Exception:
             LOGGER.exception("Could not build market portal for %s.", market_id)
             previous_portal = _as_dict(db.reference(f"{market_root}/portal_view").get())
