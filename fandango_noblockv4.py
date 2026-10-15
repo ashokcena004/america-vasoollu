@@ -55,7 +55,7 @@ MANUAL_SHOWS = [
     # ["EXTRA", "", "", 16500.0, 0, 560] # Cinelounge Fremont Fans Show
 ]
 
-FORCE_UPDATE_ADVANCE = True
+FORCE_UPDATE_ADVANCE = False
 
 EXTRA_GROSS_NOTE = "Added extra gross for offline fans sold-out shows - Cinelounge Fremont 7 CA."
 
