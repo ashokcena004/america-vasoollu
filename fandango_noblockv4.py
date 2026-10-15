@@ -55,9 +55,9 @@ MANUAL_SHOWS = [
     # ["EXTRA", "", "", 16500.0, 0, 560] # Cinelounge Fremont Fans Show
 ]
 
-FORCE_UPDATE_ADVANCE = False
-
 EXTRA_GROSS_NOTE = "Added extra gross for offline fans sold-out shows - Cinelounge Fremont 7 CA."
+
+FORCE_UPDATE_ADVANCE = False
 
 MAPPING_FILE = "state_theatre_mapping.json"
 OVERWRITE_SNAPSHOT = os.getenv("OVERWRITE_SNAPSHOT", "false").lower() == "true" # ⚠️ Set to True to update the baseline after this run
