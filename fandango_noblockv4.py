@@ -28,15 +28,16 @@ from utils.generateFandangoImageReport import generate_fandango_image_report
 # ── 1. CONFIGURATION ─────────────────────────────────────────────────────────
 # =============================================================================
 
-SHOW_DATE = "2026-10-15"
-URL = "https://www.fandango.com/jailer-2-247862/movie-overview"
+SHOW_DATE = "2026-11-04"
+URL = "https://www.fandango.com/ramayana-2026-245446/movie-overview"
+# URL = "https://www.fandango.com/jailer-2-247862/movie-overview"
 
-GLOBAL_MOVIE_SLUG = "jailer-2"  # Keep identical in the India scraper for this movie.
+GLOBAL_MOVIE_SLUG = "ramayana"  # Keep identical in the India scraper for this movie.
 
 # 🚨 FALLBACK & PRICING CONFIGURATION
-AVG_PRICE = 32.00
-MAX_TIER_PRICE = 32.00 #XD D-Box Pricing
-DEFAULT_LANGUAGE = "Tamil"
+AVG_PRICE = 30.00
+MAX_TIER_PRICE = 30.00 #XD D-Box Pricing
+DEFAULT_LANGUAGE = "Hindi"
 FALLBACK_SEATS = 100
 PRICE_TAX_CUT = False  # If True, rounds ticket prices down to nearest multiple of 5 (e.g., $29 -> $25)
 OCC_THRESHOLD_FRONTROW = 0.50  # If overall occupancy is below this, treat front row 'R' seats as blocks
