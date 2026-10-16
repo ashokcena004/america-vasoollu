@@ -33,7 +33,7 @@ SHOW_DATE = "2026-10-16"
 GLOBAL_MOVIE_SLUG = "jailer-2"
 
 
-FORCE_UPDATE_ADVANCE = True
+FORCE_UPDATE_ADVANCE = False
 
 # 🚫 IGNORE SOLD OUT SHOWS FOR SPECIFIC CHAINS
 # If a show at these chains is "Sold Out", its tickets and gross will be zeroed out.
