@@ -1486,7 +1486,7 @@ if __name__ == "__main__":
                     show['status'] = "Sold Out (Ignored)"
 
     # =========================================================================
-    # ── 4.8 (RESCUE PASSED SHOWS & PATCH ERRORS) ────
+    # ── 4.8 (CUMULATIVE MODE: RESCUE PASSED SHOWS & PATCH ERRORS) ────
     # =========================================================================
     if recent_shows_data:
         print(f"\n🛡️ Last Run Data Found! Rescuing dropped shows and patching API errors...")
