@@ -6,6 +6,7 @@ from build_portal_views import (
     _build_global_portal,
     _lifecycle_rollup,
     _market_today,
+    _apply_matching_advance_occupancy,
     build_portal_views,
 )
 
@@ -31,6 +32,78 @@ class FakeDatabase:
 
 
 class PortalLifecycleTests(unittest.TestCase):
+    def test_matching_advance_run_supplies_missing_current_occupancy(self):
+        current_summaries = {
+            "2026-10-16": {
+                "metrics": {
+                    "booked_gross": 47055989.38,
+                    "booked_tickets": 271925,
+                    "show_count": 2694,
+                    "capacity_seats": 0,
+                    "occupancy_rate": 0,
+                }
+            }
+        }
+        advance_summaries = {
+            "2026-10-16": {
+                "metrics": {
+                    "booked_gross": 47055989.38,
+                    "booked_tickets": 271925,
+                    "show_count": 2694,
+                    "capacity_seats": 912317,
+                    "occupancy_rate": 0,
+                }
+            }
+        }
+
+        estimated_dates = _apply_matching_advance_occupancy(
+            current_summaries,
+            advance_summaries,
+        )
+
+        self.assertEqual(estimated_dates, {"2026-10-16"})
+        self.assertEqual(
+            current_summaries["2026-10-16"]["metrics"]["capacity_seats"],
+            912317,
+        )
+        self.assertAlmostEqual(
+            current_summaries["2026-10-16"]["metrics"]["occupancy_rate"],
+            29.8059775,
+            places=5,
+        )
+
+    def test_does_not_use_advance_occupancy_when_sales_do_not_match(self):
+        current_summaries = {
+            "2026-10-16": {
+                "metrics": {
+                    "booked_gross": 100,
+                    "booked_tickets": 10,
+                    "show_count": 2,
+                    "capacity_seats": 0,
+                    "occupancy_rate": 0,
+                }
+            }
+        }
+        advance_summaries = {
+            "2026-10-16": {
+                "metrics": {
+                    "booked_gross": 101,
+                    "booked_tickets": 10,
+                    "show_count": 2,
+                    "capacity_seats": 100,
+                    "occupancy_rate": 10,
+                }
+            }
+        }
+
+        estimated_dates = _apply_matching_advance_occupancy(
+            current_summaries,
+            advance_summaries,
+        )
+
+        self.assertEqual(estimated_dates, set())
+        self.assertEqual(current_summaries["2026-10-16"]["metrics"]["capacity_seats"], 0)
+
     def test_today_advance_is_provisional_current_data_until_scrape_publishes(self):
         database = FakeDatabase()
         movie_id = "today-presales"
@@ -80,6 +153,9 @@ class PortalLifecycleTests(unittest.TestCase):
                 "occupancy_rate": 40,
             }
         }
+        database.values[f"{movie_root}/dates/{date_key}/published"][
+            "active_run_id"
+        ] = "stale-current-run-pointer"
 
         result = build_portal_views(
             database,

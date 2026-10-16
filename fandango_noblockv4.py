@@ -29,39 +29,96 @@ from utils.generateFandangoImageReport import generate_fandango_image_report
 # =============================================================================
 
 SHOW_DATE = "2026-11-04"
-URL = "https://www.fandango.com/ramayana-2026-245446/movie-overview"
-# URL = "https://www.fandango.com/jailer-2-247862/movie-overview"
 
-GLOBAL_MOVIE_SLUG = "ramayana"  # Keep identical in the India scraper for this movie.
+GLOBAL_MOVIE_SLUG = "ramayana"
 
-# 🚨 FALLBACK & PRICING CONFIGURATION
-AVG_PRICE = 30.00
-MAX_TIER_PRICE = 30.00 #XD D-Box Pricing
-DEFAULT_LANGUAGE = "Hindi"
-FALLBACK_SEATS = 100
-PRICE_TAX_CUT = False  # If True, rounds ticket prices down to nearest multiple of 5 (e.g., $29 -> $25)
-OCC_THRESHOLD_FRONTROW = 0.50  # If overall occupancy is below this, treat front row 'R' seats as blocks
-
-
-# 📝 MANUAL SHOWS OVERRIDE (Fan Shows / Missing API Data)
-# Format: ["State", "Theater_ID", "Showtime", Booked_Gross, Total_Gross, Booked_Tickets, Total_Tickets, Occupancy_Percentage, Format (Optional), Language (Optional)]
-# For EXTRA: ["EXTRA", "", "", Booked_Gross, 0, Booked_Tickets]
-MANUAL_SHOWS = [
-    #["EXTRA", "", "", 3300.0, 0, 115], #2000 extra blocked in venky, 1300 for AMC River east
-    # Example of a fully detailed manual normal show:
-    # ["Illinois", "AABCD", "7:00 PM", 1500.0, 3000.0, 75, 150, 0.50, "IMAX", "Telugu"]
-    #["New Jersey", "AAEMI", "6:20 PM", 3125.0, 3125.0, 125, 125, 1.0, "Manual", "Telugu"],
-    #["New Jersey", "AAEMI", "6:35 PM", 3125.0, 3125.0, 125, 125, 1.0, "Manual", "Telugu"],
-    # ["EXTRA", "", "", 4000.0, 0, 160]
-    # ["EXTRA", "", "", 16500.0, 0, 560] # Cinelounge Fremont Fans Show
-]
-
-EXTRA_GROSS_NOTE = "Added extra gross for offline fans sold-out shows - Cinelounge Fremont 7 CA."
 
 FORCE_UPDATE_ADVANCE = False
 
+# 🚫 IGNORE SOLD OUT SHOWS FOR SPECIFIC CHAINS
+# If a show at these chains is "Sold Out", its tickets and gross will be zeroed out.
+IGNORE_SOLDOUT_CHAINS = [] #Eg: AMC
+
+# =============================================================================
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MOVIE_CONFIG_PATH = os.path.join(SCRIPT_DIR, "data", "movie_config.json")
+
+def load_movie_config(config_path, global_slug):
+    try:
+        with open(config_path, "r", encoding="utf-8") as config_file:
+            movie_configs = json.load(config_file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not load movie configuration at {config_path}.") from exc
+
+    if not isinstance(movie_configs, dict):
+        raise ValueError(f"Movie configuration must be a JSON object: {config_path}")
+    movie_config = movie_configs.get(global_slug)
+    if not isinstance(movie_config, dict):
+        raise KeyError(
+            f"No movie configuration found for global slug {global_slug!r} "
+            f"in {config_path}."
+        )
+
+    for field in ("movie_url", "default_language"):
+        if not isinstance(movie_config.get(field), str) or not movie_config[field].strip():
+            raise ValueError(
+                f"Movie configuration for {global_slug!r} must provide "
+                f"a non-empty {field!r}."
+            )
+    for field in ("average_price", "max_price"):
+        value = movie_config.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ValueError(
+                f"Movie configuration field {field!r} for {global_slug!r} "
+                "must be a non-negative number."
+            )
+    for field in ("poster_url", "cover_url", "release_date"):
+        if field in movie_config and not isinstance(movie_config[field], str):
+            raise ValueError(
+                f"Movie configuration field {field!r} for {global_slug!r} "
+                "must be a string."
+            )
+    extra = movie_config.get("extra", [])
+    if not isinstance(extra, list):
+        raise ValueError(
+            f"Movie configuration field 'extra' for {global_slug!r} must be a list."
+        )
+    if extra and (
+        len(extra) != 6
+        or not isinstance(extra[0], str)
+        or extra[0].upper() != "EXTRA"
+    ):
+        raise ValueError(
+            f"Movie configuration field 'extra' for {global_slug!r} must be "
+            'empty or shaped like ["EXTRA", "", "", gross, 0, tickets].'
+        )
+
+    return movie_config
+
+
+MOVIE_CONFIG = load_movie_config(MOVIE_CONFIG_PATH, GLOBAL_MOVIE_SLUG)
+URL = MOVIE_CONFIG["movie_url"]
+AVG_PRICE = float(MOVIE_CONFIG["average_price"])
+MAX_TIER_PRICE = float(MOVIE_CONFIG["max_price"])
+DEFAULT_LANGUAGE = MOVIE_CONFIG["default_language"]
+EXTRA = MOVIE_CONFIG.get("extra", [])
+MANUAL_SHOWS = [EXTRA] if EXTRA else []
+MOVIE_METADATA = {
+    field: MOVIE_CONFIG.get(field, "").strip()
+    for field in ("poster_url", "cover_url", "release_date")
+}
+
+EXTRA_GROSS_NOTE = "Added extra gross for offline fans sold-out shows!"
+
+# =============================================================================
+
 MAPPING_FILE = "state_theatre_mapping.json"
 OVERWRITE_SNAPSHOT = os.getenv("OVERWRITE_SNAPSHOT", "false").lower() == "true" # ⚠️ Set to True to update the baseline after this run
+
+FALLBACK_SEATS = 100
+PRICE_TAX_CUT = False  # If True, rounds ticket prices down to nearest multiple of 5 (e.g., $29 -> $25)
+OCC_THRESHOLD_FRONTROW = 0.50  # If overall occupancy is below this, treat front row 'R' seats as blocks
 
 SEAT_COUNT_MODE = 1
 # 1 = Use physical seat map count when available (more accurate but slower)
@@ -80,12 +137,11 @@ PREFER_PHYSICAL_SCREENS = []
 # This will surgically combine their seat capacities, tickets sold, and financial gross post-scrape.
 MANUAL_MERGE_SHOWS_THEATRES = ["AAILI"]
 
-# 🚫 IGNORE SOLD OUT SHOWS FOR SPECIFIC CHAINS
-# If a show at these chains is "Sold Out", its tickets and gross will be zeroed out.
-IGNORE_SOLDOUT_CHAINS = [] #Eg: AMC
-
 # Extra Movie Details
-movie_part = URL.split("/")[-2]
+movie_parts = URL.rstrip("/").split("/")
+if len(movie_parts) < 2 or not movie_parts[-2]:
+    raise ValueError(f"Invalid Fandango movie URL in configuration: {URL!r}")
+movie_part = movie_parts[-2]
 MOVIE_ID = re.search(r"-(\d+)$", movie_part).group(1)
 MOVIE_SLUG = re.sub(r"-\d+$", "", movie_part)
 MOVIE_TITLE = MOVIE_SLUG.replace("-", " ").title()
@@ -187,7 +243,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         
                         # 2. EXTRACT FORMAT SCANNER ONLY FOR REPORTS (Restores precise casing)
                         show_format = base_format
-                        premium_keywords = ["XD", "IMAX", "3D", "LASER AT AMC", "4DX", "RPX", "D-BOX"]
+                        premium_keywords = ["XD", "IMAX", "LASER AT AMC", "4DX", "RPX", "D-BOX"]
                         for am_name, am_up in zip(raw_amenities, raw_amenities_upper):
                             if any(k in am_up for k in premium_keywords) and show_format == base_format:
                                 show_format = am_name
@@ -1422,10 +1478,10 @@ if __name__ == "__main__":
                     show['status'] = "Sold Out (Ignored)"
 
     # =========================================================================
-    # ── 4.8 CUMULATIVE TRACKING MODE (RESCUE PASSED SHOWS & PATCH ERRORS) ────
+    # ── 4.8 (RESCUE PASSED SHOWS & PATCH ERRORS) ────
     # =========================================================================
     if recent_shows_data:
-        print(f"\n🛡️ Activating Cumulative Tracking Mode: Rescuing dropped shows and patching API errors...")
+        print(f"\n🛡️ Last Run Data Found! Rescuing dropped shows and patching API errors...")
         
         # Dictionary mapping exact JSON State keys to their primary timezone
         STATE_TIMEZONES = {
@@ -1565,7 +1621,7 @@ if __name__ == "__main__":
                 # If it's NOT an API crash, we do absolutely nothing.
                 # We strictly trust the live data, even if the gross goes down due to unblocked seats.
 
-        print(f"   => ✅ Cumulative Tracking Complete: Rescued {rescued_shows_count} past shows. Dropped {dropped_shows_count} cancelled future shows. Patched {protected_shows_count} API errors.")
+        print(f"   => ✅ Rescued {rescued_shows_count} past shows. Dropped {dropped_shows_count} cancelled future shows. Patched {protected_shows_count} API errors.")
 
     # =========================================================================
     # ── 4.9 SAVE REPORT ARTIFACTS (GitHub Actions Downloadable, Not Committed) ─
@@ -1695,11 +1751,17 @@ if __name__ == "__main__":
             print("✅ V2 analytics summary and detail pages published.")
 
             try:
+                movie_metadata = {
+                    key: value
+                    for key, value in MOVIE_METADATA.items()
+                    if value
+                }
                 db.reference(
                     f"markets/usa/movies/{MOVIE_SLUG}/meta"
                 ).update({
                     "title": MOVIE_TITLE,
                     "global_slug": GLOBAL_MOVIE_SLUG.strip(),
+                    **movie_metadata,
                 })
                 db.reference(
                     f"markets/usa/movie_index/{MOVIE_SLUG}"
@@ -1707,6 +1769,7 @@ if __name__ == "__main__":
                     "movie_id": MOVIE_SLUG,
                     "name": MOVIE_TITLE,
                     "global_slug": GLOBAL_MOVIE_SLUG.strip(),
+                    **movie_metadata,
                 })
 
                 from build_portal_views import DEFAULT_INR_TO_USD, run_portal_views

@@ -141,12 +141,11 @@ def _read_date_summaries(
             ).get()
         )
         availability = _as_dict(date_index.get(show_date))
-        has_active_run = bool(
-            availability.get("has_current") or published.get("active_run_id")
-        )
+        has_current = bool(availability.get("has_current"))
         use_advance_for_current = (
             day <= as_of_date
-            and not has_active_run
+            and not has_current
+            and bool(availability.get("has_advance"))
             and _has_authoritative_sales(advance_contribution)
         )
 
@@ -365,6 +364,45 @@ def _occupancy_rollup(summaries: dict[str, dict]) -> float:
     return 0.0
 
 
+def _apply_matching_advance_occupancy(
+    current_summaries: dict[str, dict],
+    advance_summaries: dict[str, dict],
+) -> set[str]:
+    estimated_dates = set()
+    for show_date, current_summary in current_summaries.items():
+        current_metrics = _as_dict(current_summary.get("metrics"))
+        if (
+            _number(current_metrics.get("capacity_seats")) > 0
+            or _occupancy(current_metrics) > 0
+        ):
+            continue
+
+        advance_summary = _as_dict(advance_summaries.get(show_date))
+        advance_metrics = _as_dict(advance_summary.get("metrics"))
+        if _occupancy(advance_metrics) <= 0:
+            continue
+
+        sales_match = all(
+            _number(current_metrics.get(key)) == _number(advance_metrics.get(key))
+            for key in ("booked_gross", "booked_tickets", "show_count")
+        )
+        if not sales_match or not (
+            _number(current_metrics.get("booked_gross")) > 0
+            or _number(current_metrics.get("booked_tickets")) > 0
+        ):
+            continue
+
+        updated_metrics = dict(current_metrics)
+        updated_metrics["capacity_seats"] = _number(advance_metrics.get("capacity_seats"))
+        updated_metrics["occupancy_rate"] = _occupancy(advance_metrics) * 100
+        current_summaries[show_date] = {
+            **current_summary,
+            "metrics": updated_metrics,
+        }
+        estimated_dates.add(show_date)
+    return estimated_dates
+
+
 def _latest_metrics(summaries: dict[str, dict]) -> dict:
     if not summaries:
         return {}
@@ -487,6 +525,17 @@ def _movie_documents(
     for month in months.values():
         rollup_dates.update(_as_dict(_as_dict(month).get("dates")))
 
+    current_summaries, advance_summaries, estimated_current_dates = _read_date_summaries(
+        db,
+        market_id,
+        movie_id,
+        rollup_dates,
+        source_date_index,
+        as_of_date,
+    )
+    estimated_current_dates.update(
+        _apply_matching_advance_occupancy(current_summaries, advance_summaries)
+    )
     lifecycle = _lifecycle_rollup(rollup_dates, as_of_date, source_date_index)
     current_totals = _scope_totals(
         rollup_dates,
@@ -496,14 +545,6 @@ def _movie_documents(
     )
     advance_totals = _scope_totals(
         rollup_dates, source_date_index, "advance", as_of_date
-    )
-    current_summaries, advance_summaries, estimated_current_dates = _read_date_summaries(
-        db,
-        market_id,
-        movie_id,
-        rollup_dates,
-        source_date_index,
-        as_of_date,
     )
     future_advance_summaries = {
         show_date: summary
