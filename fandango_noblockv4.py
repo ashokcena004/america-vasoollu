@@ -144,7 +144,15 @@ if len(movie_parts) < 2 or not movie_parts[-2]:
 movie_part = movie_parts[-2]
 MOVIE_ID = re.search(r"-(\d+)$", movie_part).group(1)
 MOVIE_SLUG = re.sub(r"-\d+$", "", movie_part)
-MOVIE_TITLE = MOVIE_SLUG.replace("-", " ").title()
+
+def format_movie_title(movie_slug):
+    title_words = movie_slug.replace("-", " ").title().split()
+    if len(title_words) > 1 and re.fullmatch(r"(?:19|20)\d{2}", title_words[-1]):
+        title_words.pop()
+    return " ".join(title_words)
+
+
+MOVIE_TITLE = format_movie_title(MOVIE_SLUG)
 
 # 🚀 MULTI-THREADING CONFIGURATION
 MAX_WORKERS = 5  # Optimal balance between speed and Akamai bot-detection
