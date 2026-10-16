@@ -28,9 +28,9 @@ from utils.generateFandangoImageReport import generate_fandango_image_report
 # ── 1. CONFIGURATION ─────────────────────────────────────────────────────────
 # =============================================================================
 
-SHOW_DATE = "2026-10-16"
+SHOW_DATE = "2026-11-04"
 
-GLOBAL_MOVIE_SLUG = "jailer-2"
+GLOBAL_MOVIE_SLUG = "ramayana"
 
 
 FORCE_UPDATE_ADVANCE = False
