@@ -536,6 +536,70 @@ class AnalyticsV2Tests(unittest.TestCase):
             {"timestamp", "shows", "booked_tickets", "total_gross", "occupancy"},
         )
 
+    def test_first_same_day_run_is_also_published_as_advance(self):
+        database = FakeDatabase()
+        root = "markets/usa/movies/example-film/dates/2026-10-10"
+        first_payload = build_analytics_payload(
+            [make_show("8:00 PM", 10, 100)],
+            market_id="usa",
+            movie_id="example-film",
+            show_date="2026-10-10",
+            run_id="first-run",
+        )
+
+        publish_analytics_payload(
+            database,
+            "usa",
+            "example-film",
+            "2026-10-10",
+            first_payload,
+            update_advance_snapshot=False,
+            as_of_date="2026-10-10",
+        )
+
+        pointer = database.values[f"{root}/published"]
+        self.assertEqual(pointer["active_run_id"], "first-run")
+        self.assertEqual(pointer["advance_run_id"], "first-run")
+        self.assertTrue(pointer["advance_details_available"])
+        self.assertEqual(
+            database.values[
+                "markets/usa/movies/example-film/date_index/2026-10-10"
+            ],
+            {"has_current": True, "has_advance": True},
+        )
+        self.assertEqual(
+            database.values[
+                "markets/usa/pulse/v1/dates/2026-10-10/advance/example-film"
+            ]["run_id"],
+            "first-run",
+        )
+        snapshot = database.values[
+            "markets/usa/movies/example-film/cumulative/v1/bases/"
+            "fandango_reported/months/2026-10"
+        ]["dates"]["2026-10-10"]
+        self.assertEqual(snapshot["current"]["booked_gross"], 100)
+        self.assertEqual(snapshot["advance"]["booked_gross"], 100)
+
+        second_payload = build_analytics_payload(
+            [make_show("8:00 PM", 20, 200)],
+            market_id="usa",
+            movie_id="example-film",
+            show_date="2026-10-10",
+            run_id="second-run",
+        )
+        publish_analytics_payload(
+            database,
+            "usa",
+            "example-film",
+            "2026-10-10",
+            second_payload,
+            update_advance_snapshot=False,
+            as_of_date="2026-10-10",
+        )
+        pointer = database.values[f"{root}/published"]
+        self.assertEqual(pointer["active_run_id"], "second-run")
+        self.assertEqual(pointer["advance_run_id"], "first-run")
+
     def test_publisher_does_not_use_active_counts_for_legacy_distinct_advance_run(self):
         database = FakeDatabase()
         root = "markets/usa/movies/example-film/dates/2026-10-10"

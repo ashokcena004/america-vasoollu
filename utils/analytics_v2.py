@@ -727,6 +727,13 @@ def publish_analytics_payload(
     previous = published_ref.get() or {}
     previous_run_id = previous.get("active_run_id")
     previous_advance_run_id = previous.get("advance_run_id")
+    if (
+        not update_advance_snapshot
+        and show_day == effective_as_of_date
+        and not previous_run_id
+        and not previous_advance_run_id
+    ):
+        update_advance_snapshot = True
     advance_run_id = run_id if update_advance_snapshot else previous_advance_run_id
     detail_count = len(shows)
     detail_page_count = (detail_count + PAGE_SIZE - 1) // PAGE_SIZE
