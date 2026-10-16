@@ -7,6 +7,7 @@ from build_portal_views import (
     _lifecycle_rollup,
     _market_today,
     _apply_matching_advance_occupancy,
+    _latest_observed_at,
     build_portal_views,
 )
 
@@ -32,6 +33,18 @@ class FakeDatabase:
 
 
 class PortalLifecycleTests(unittest.TestCase):
+    def test_latest_observed_at_uses_timestamp_order_across_timezones(self):
+        observed_at = _latest_observed_at(
+            {
+                "2026-10-16": {"observed_at": "2026-10-16T14:00:00-05:00"},
+            },
+            {
+                "2026-10-17": {"observed_at": "2026-10-16T19:30:00Z"},
+            },
+        )
+
+        self.assertEqual(observed_at, "2026-10-16T19:30:00Z")
+
     def test_matching_advance_run_supplies_missing_current_occupancy(self):
         current_summaries = {
             "2026-10-16": {

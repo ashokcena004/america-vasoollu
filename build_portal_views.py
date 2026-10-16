@@ -218,6 +218,25 @@ def _read_date_summaries(
     return current_summaries, advance_summaries, estimated_current_dates
 
 
+def _latest_observed_at(*summary_sets: dict) -> str | None:
+    observations = []
+    for summaries in summary_sets:
+        for summary in summaries.values():
+            observed_at = _as_dict(summary).get("observed_at")
+            if not observed_at:
+                continue
+            value = str(observed_at)
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                LOGGER.warning("Ignoring invalid analytics observation timestamp %r.", value)
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            observations.append((parsed.astimezone(timezone.utc), value))
+    return max(observations, default=(None, None), key=lambda item: item[0])[1]
+
+
 def _delta(metrics: dict, public_key: str, legacy_key: str) -> float:
     if public_key in metrics:
         return _number(metrics.get(public_key))
@@ -551,6 +570,7 @@ def _movie_documents(
         for show_date, summary in advance_summaries.items()
         if (_date_value(show_date) or as_of_date) > as_of_date
     }
+    last_observed_at = _latest_observed_at(current_summaries, advance_summaries)
 
     title = str(
         metadata.get("title")
@@ -613,6 +633,7 @@ def _movie_documents(
         "movie_id": movie_id,
         "currency": currency,
         "updated_at": updated_at,
+        "last_observed_at": last_observed_at,
         "status": lifecycle["status"],
         "as_of_date": as_of_date.isoformat(),
         "first_valid_show_date": lifecycle["first_valid_show_date"],
