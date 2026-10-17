@@ -7,6 +7,7 @@ import os
 import re
 import json
 from datetime import datetime
+from utils.analytics_v2 import format_categories_for_show, report_format_label
 
 
 def format_currency_usd(value):
@@ -126,10 +127,7 @@ def generate_fandango_html_report(
 
     for row in data:
 
-        fmt = row.get('format', 'Standard')
-
-        if 'D-Box' in fmt and 'Premium' in fmt:
-            fmt = 'Premium'
+        fmt = report_format_label(row)
 
         frontend_rows.append({
 
@@ -137,6 +135,8 @@ def generate_fandango_html_report(
             'state': row.get('state', 'Unknown'),
             'theater': row.get('theater', 'Unknown'),
             'format': fmt,
+            'internalFormat': row.get('format', 'Standard'),
+            'format_categories': format_categories_for_show(row),
             'language': row.get('language', 'Unknown'),
             'time': row.get('time', 'Unknown'),
 
@@ -172,10 +172,7 @@ def generate_fandango_html_report(
 
     for row in (previous_shows_data or []):
 
-        fmt = row.get('format', 'Standard')
-
-        if 'D-Box' in fmt and 'Premium' in fmt:
-            fmt = 'Premium'
+        fmt = report_format_label(row)
 
         previous_frontend_rows.append({
 
@@ -183,6 +180,8 @@ def generate_fandango_html_report(
             'state': row.get('state', 'Unknown'),
             'theater': row.get('theater', 'Unknown'),
             'format': fmt,
+            'internalFormat': row.get('format', 'Standard'),
+            'format_categories': format_categories_for_show(row),
             'language': row.get('language', 'Unknown'),
             'time': row.get('time', 'Unknown'),
             'gross': row.get('gross', 0),
@@ -1466,6 +1465,9 @@ tr:hover td {{
             <h2>
                 Format Distribution
             </h2>
+            <p style="color: #a0a0b4; margin: -8px 0 16px;">
+                Shows can appear in multiple format categories; do not sum these rows.
+            </p>
 
             <table>
 
@@ -2953,7 +2955,7 @@ createApp({{
                             &&
                             p.time === r.time
                             &&
-                            p.format === r.format
+                        p.internalFormat === r.internalFormat
                             &&
                             p.language === r.language
 
@@ -3156,35 +3158,41 @@ createApp({{
 
             this.filteredData.forEach(r => {{
 
-                const key = r[field];
+                const keys = field === 'format'
+                    ? (r.format_categories?.length ? r.format_categories : [r.format])
+                    : [r[field]];
 
-                if (!map[key]) {{
+                keys.forEach(key => {{
 
-                    map[key] = {{
+                    if (!map[key]) {{
 
-                        name: key,
+                        map[key] = {{
 
-                        state: r.state,
+                            name: key,
 
-                        shows: 0,
+                            state: r.state,
 
-                        total: 0,
+                            shows: 0,
 
-                        booked: 0,
+                            total: 0,
 
-                        gross: 0
+                            booked: 0,
+
+                            gross: 0
+
+                        }}
 
                     }}
 
-                }}
+                    map[key].shows += 1;
 
-                map[key].shows += 1;
+                    map[key].total += r.total;
 
-                map[key].total += r.total;
+                    map[key].booked += r.booked;
 
-                map[key].booked += r.booked;
+                    map[key].gross += r.gross;
 
-                map[key].gross += r.gross;
+                }});
 
             }});
 
@@ -3249,11 +3257,13 @@ createApp({{
 
             previousFiltered.forEach(r => {{
 
-                let key = r[field];
+                const keys = field === 'format'
+                    ? (r.format_categories?.length ? r.format_categories : [r.format])
+                    : [r[field]];
 
                 if (field === 'chain') {{
 
-                    key = this.getChainCategory(
+                    keys[0] = this.getChainCategory(
                         r.theater || ''
                     );
 
@@ -3261,27 +3271,42 @@ createApp({{
 
                 if (field === 'timeCat') {{
 
-                    key = this.getTimeCategory(
+                    keys[0] = this.getTimeCategory(
                         r.time || ''
                     );
 
                 }}
 
-                if (!previousMap[key]) {{
+                keys.forEach(key => {{
+                    if (!previousMap[key]) {{
+                        previousMap[key] = {{
+                            booked: 0,
+                            gross: 0,
+                            shows: 0
+                        }};
+                    }}
 
-                    previousMap[key] = {{
-                        booked: 0,
-                        gross: 0,
-                        shows: 0
-                    }};
-
-                }}
-
-                previousMap[key].booked += r.booked || 0;
-                previousMap[key].gross += r.gross || 0;
-                previousMap[key].shows += 1;
+                    previousMap[key].booked += r.booked || 0;
+                    previousMap[key].gross += r.gross || 0;
+                    previousMap[key].shows += 1;
+                }});
 
             }});
+
+            if (field === 'format') {{
+                Object.keys(previousMap).forEach(key => {{
+                    if (!map[key]) {{
+                        map[key] = {{
+                            name: key,
+                            state: '',
+                            shows: 0,
+                            total: 0,
+                            booked: 0,
+                            gross: 0
+                        }};
+                    }}
+                }});
+            }}
 
             return Object.values(map)
 

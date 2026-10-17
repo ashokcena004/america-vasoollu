@@ -4,6 +4,7 @@ import openpyxl
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
+from utils.analytics_v2 import build_format_summary, report_format_label
 
 def get_time_category(time_str):
     try:
@@ -143,6 +144,7 @@ def export_master_excel(data, base_filename, previous_shows_data=None, last_upda
         occ = round((row['booked'] / row['total']) * 100, 2) if row['total'] > 0 else 0
         fmt = row['format']
         if 'D-Box' in fmt and 'Premium' in fmt: fmt = 'Premium'
+        display_fmt = report_format_label(row)
         chain = get_chain_category(row['theater'])
         time_cat = get_time_category(row['time'])
         
@@ -156,7 +158,7 @@ def export_master_excel(data, base_filename, previous_shows_data=None, last_upda
         ws_shows.append([
             row['state'], 
             chain, 
-            fmt, 
+            display_fmt,
             row.get('language', 'Unknown'),
             row['theater'], 
             row['time'], 
@@ -318,35 +320,20 @@ def export_master_excel(data, base_filename, previous_shows_data=None, last_upda
         ws_time.append([cat, stats['shows'], stats['tickets'], stats['booked'], round(stats['gross'], 2), occ, stats['d_shows'], stats['d_tickets'], round(stats['d_gross'], 2)])
 
     # 6. Format Summary
-    fmt_summary = {}
-    for row in data:
-        if row.get('is_extra', False): continue
-            
-        fmt = row['format']
-        if 'D-Box' in fmt and 'Premium' in fmt: fmt = 'Premium'
-            
-        if fmt not in fmt_summary:
-            fmt_summary[fmt] = {'shows': 0, 'tickets': 0, 'booked': 0, 'gross': 0.0, 'd_shows': 0, 'd_tickets': 0, 'd_gross': 0.0}
-        fmt_summary[fmt]['shows'] += 1
-        fmt_summary[fmt]['tickets'] += row['total']
-        fmt_summary[fmt]['booked'] += row['booked']
-        fmt_summary[fmt]['gross'] += row['gross']
-        
-        show_key = f"{row['t_id']}_{row['time']}_{fmt}"
-        p_show = p_shows_map.get(show_key)
-        
-        if not p_show:
-            fmt_summary[fmt]['d_shows'] += 1
-            fmt_summary[fmt]['d_tickets'] += row['booked']
-            fmt_summary[fmt]['d_gross'] += row['gross']
-        else:
-            fmt_summary[fmt]['d_tickets'] += (row['booked'] - p_show['booked'])
-            fmt_summary[fmt]['d_gross'] += (row['gross'] - p_show['gross'])
-
-    ws_fmt.append(['Screen Format', 'Total Shows', 'Tickets', 'Tickets Sold', 'Gross ($)', 'Occupancy %', 'Shows Growth', 'Tickets Growth', 'Gross Growth'])
-    for fmt, stats in sorted(fmt_summary.items(), key=lambda x: x[1]['gross'], reverse=True):
-        occ = round((stats['booked'] / stats['tickets']) * 100, 2) if stats['tickets'] > 0 else 0
-        ws_fmt.append([fmt, stats['shows'], stats['tickets'], stats['booked'], round(stats['gross'], 2), occ, stats['d_shows'], stats['d_tickets'], round(stats['d_gross'], 2)])
+    fmt_summary = build_format_summary(data, previous_shows_data)
+    ws_fmt.append(['Screen Format (overlapping; do not sum rows)', 'Total Shows', 'Tickets', 'Tickets Sold', 'Gross ($)', 'Occupancy %', 'Shows Growth', 'Tickets Growth', 'Gross Growth'])
+    for stats in sorted(fmt_summary.values(), key=lambda item: item['booked_gross'], reverse=True):
+        ws_fmt.append([
+            stats['name'],
+            stats['show_count'],
+            stats['capacity_seats'],
+            stats['booked_tickets'],
+            round(stats['booked_gross'], 2),
+            round(stats['occupancy_rate'], 2),
+            stats['shows_delta'],
+            stats['tickets_delta'],
+            round(stats['gross_delta'], 2),
+        ])
 
     # 7. Overall KPIs (Top Sheet)
     total_venues = len(set(r['t_id'] for r in data if r['t_id'] != 'EXTRA'))

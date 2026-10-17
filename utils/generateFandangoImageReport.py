@@ -5,6 +5,7 @@ Premium Box Office Image Generator - Deep Space Glassmorphism UI
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
 from datetime import datetime
 import os
+from utils.analytics_v2 import build_format_summary
 
 W   = 2560      
 PAD = 80        
@@ -153,14 +154,15 @@ def generate_fandango_image_report(data, filename, movie_name="Movie", show_date
             lang_summary[lang]['d_tickets'] += d_tix
             lang_summary[lang]['d_gross'] += d_grs
 
-        if not is_extra:
-            if fmt not in fmt_summary: fmt_summary[fmt] = {'shows': 0, 'tickets': 0, 'booked': 0, 'gross': 0.0, 'd_tickets': 0, 'd_gross': 0.0}
-            fmt_summary[fmt]['shows'] += 1
-            fmt_summary[fmt]['tickets'] += row['total']
-            fmt_summary[fmt]['booked'] += row['booked']
-            fmt_summary[fmt]['gross'] += row['gross']
-            fmt_summary[fmt]['d_tickets'] += d_tix
-            fmt_summary[fmt]['d_gross'] += d_grs
+    for category, stats in build_format_summary(data, previous_shows_data).items():
+        fmt_summary[category] = {
+            'shows': stats['show_count'],
+            'tickets': stats['capacity_seats'],
+            'booked': stats['booked_tickets'],
+            'gross': stats['booked_gross'],
+            'd_tickets': stats['tickets_delta'],
+            'd_gross': stats['gross_delta'],
+        }
 
     states_list = sorted([{'name': k, **v} for k, v in state_summary.items()], key=lambda x: x['gross'], reverse=True)
     theaters_list = sorted([{'id': k, **v} for k, v in theater_summary.items()], key=lambda x: x['gross'], reverse=True)
@@ -370,7 +372,7 @@ def generate_fandango_image_report(data, filename, movie_name="Movie", show_date
             })
         return out
 
-    draw_table(PAD, r2_y, col_w, fl_h, "Format Distribution", fl_cols, build_fl_rows(fmt_list), is_fmt_lang=True)
+    draw_table(PAD, r2_y, col_w, fl_h, "Formats (overlapping totals)", fl_cols, build_fl_rows(fmt_list), is_fmt_lang=True)
     draw_table(PAD + col_w + 40, r2_y, col_w, fl_h, "Language Distribution", fl_cols, build_fl_rows(lang_list), is_fmt_lang=True)
 
     # --- ROW 3: STATES & THEATERS ---

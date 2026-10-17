@@ -18,7 +18,12 @@ load_dotenv()
 
 import firebase_admin
 from firebase_admin import credentials, db
-from utils.analytics_v2 import build_analytics_payload, publish_analytics_payload
+from utils.analytics_v2 import (
+    build_analytics_payload,
+    classify_report_formats,
+    combine_report_format_categories,
+    publish_analytics_payload,
+)
 
 from utils.generateFandangoExcelReport import export_master_excel
 from utils.generateFandangoHTMLReport import generate_fandango_html_report
@@ -273,6 +278,11 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         
                         # Recognize supported languages only before "with" or "Language".
                         show_language = detect_show_language(raw_amenities, DEFAULT_LANGUAGE)
+                        report_format_categories = classify_report_formats(
+                            " ".join([raw_header, show_format, *raw_amenities])
+                        )
+                        if is_dbox and report_format_categories == ["Standard"]:
+                            report_format_categories = []
                         
                         # 4. THE AMENITY SIGNATURE (The Master Grouper)
                         signature_amenities = [a for a in raw_amenities_upper if "D-BOX" not in a and "DBOX" not in a and "RESERVED" not in a and "RECLINERS" not in a]
@@ -298,6 +308,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                 'hash': show_hash, 
                                 'status': status, 
                                 'format': show_format, 
+                                'format_categories': report_format_categories,
                                 'language': show_language,
                                 'is_dbox': is_dbox
                             })
@@ -462,6 +473,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                     local_shows_data.append({
                                         'state': target_state, 't_id': t_id, 'theater': t_name, 
                                         'format': final_format, 'language': final_language, 'time': show_time, 'status': final_status, 
+                                        'format_categories': combine_report_format_categories(paired_tiers),
                                         'price_str': price_str, 'total': c_total, 
                                         'booked': c_booked, 'gross': c_gross,
                                         'seat_map_urls': urls_str
@@ -479,6 +491,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                         local_sold_out_queue.append({
                                             'state': target_state, 't_id': t_id, 'theater': t_name, 
                                             'format': pt['format'], 'language': pt.get('language', DEFAULT_LANGUAGE), 'time': show_time,
+                                            'format_categories': pt.get('format_categories'),
                                             'seat_map_urls': f"https://www.fandango.com/napi/seatMap/{pt.get('hash', '')}"
                                         })
                             continue # Bypass standard S9/S10 failure logic!
@@ -500,6 +513,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                             local_shows_data.append({
                                 'state': target_state, 't_id': t_id, 'theater': t_name, 
                                 'format': final_format, 'language': final_language, 'time': show_time, 'status': "Available (Map Error)", 
+                                'format_categories': combine_report_format_categories(failed_tiers),
                                 'price_str': "$0.00", 'total': 0, 
                                 'booked': 0, 'gross': 0.0,
                                 'seat_map_urls': urls_str
@@ -513,6 +527,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                 local_sold_out_queue.append({
                                     'state': target_state, 't_id': t_id, 'theater': t_name, 
                                     'format': ft['format'], 'language': ft.get('language', DEFAULT_LANGUAGE), 'time': show_time,
+                                    'format_categories': ft.get('format_categories'),
                                     'seat_map_urls': f"https://www.fandango.com/napi/seatMap/{ft.get('hash', '')}"
                                 })
                             continue
@@ -893,6 +908,7 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                         local_sold_out_queue.append({
                                             'state': target_state, 't_id': t_id, 'theater': t_name, 
                                             'format': ft['format'], 'language': ft.get('language', DEFAULT_LANGUAGE), 'time': show_time,
+                                            'format_categories': ft.get('format_categories'),
                                             'seat_map_urls': f"https://www.fandango.com/napi/seatMap/{h}"
                                         })
                                     calc_method_log = "Standalone: Queue or Ignore"
@@ -934,6 +950,9 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         local_shows_data.append({
                             'state': target_state, 't_id': t_id, 'theater': t_name, 
                             'format': final_format, 'language': final_language, 'time': show_time, 'status': final_status, 
+                            'format_categories': combine_report_format_categories(
+                                [vt['tier_info'] for vt in cluster['tiers']] + cluster['failed_tiers']
+                            ),
                             'price_str': price_str, 'total': combined_total, 
                             'booked': combined_booked, 'gross': combined_gross,
                             'seat_map_urls': matrix_urls_str
@@ -1327,6 +1346,7 @@ if __name__ == "__main__":
             master_shows_data.append({
                 'state': item['state'], 't_id': t_id, 'theater': item['theater'],
                 'format': fmt, 'language': item.get('language', DEFAULT_LANGUAGE), 'time': item['time'], 'status': "Sold Out (EXTRA)",
+                'format_categories': combine_report_format_categories([item]),
                 'price_str': price_str, 'total': combined_total,
                 'booked': combined_booked, 'gross': combined_gross,
                 'seat_map_urls': item.get('seat_map_urls', '')

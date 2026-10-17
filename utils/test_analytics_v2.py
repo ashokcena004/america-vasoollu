@@ -1,7 +1,13 @@
 import unittest
 from copy import deepcopy
 
-from utils.analytics_v2 import build_analytics_payload, publish_analytics_payload
+from utils.analytics_v2 import (
+    build_analytics_payload,
+    build_format_summary,
+    classify_report_formats,
+    combine_report_format_categories,
+    publish_analytics_payload,
+)
 
 
 def make_show(time, booked, gross, state="California"):
@@ -94,6 +100,92 @@ class AnalyticsV2Tests(unittest.TestCase):
             summary["growth"]["previous_run"]["metrics"]["booked_tickets"],
             10,
         )
+
+    def test_report_format_classifier_uses_overlapping_screen_facets_and_ignores_dbox(self):
+        self.assertEqual(classify_report_formats("IMAX 3D, D-BOX"), ["IMAX", "3D"])
+        self.assertEqual(classify_report_formats("Cinemark XD / D-BOX"), ["Cinemark XD"])
+        self.assertEqual(classify_report_formats("RPX 3D"), ["3D", "RPX"])
+        self.assertEqual(classify_report_formats("Laser at AMC"), ["Laser at AMC"])
+        self.assertEqual(classify_report_formats("4DX"), ["Other Premium"])
+        self.assertEqual(classify_report_formats("D-BOX"), ["Standard"])
+        self.assertEqual(
+            combine_report_format_categories([
+                {"format": "Cinemark XD", "format_categories": ["Cinemark XD"]},
+                {"format": "D-BOX", "format_categories": []},
+            ]),
+            ["Cinemark XD"],
+        )
+
+    def test_overlapping_format_totals_keep_show_matching_and_category_growth_separate(self):
+        current = make_show("8:00 PM", 10, 120)
+        previous = make_show("8:00 PM", 8, 100)
+        current["format"] = previous["format"] = "IMAX 3D"
+        current["format_categories"] = ["3D"]
+        previous["format_categories"] = ["IMAX"]
+
+        payload = build_analytics_payload(
+            [current],
+            market_id="usa",
+            movie_id="example-film",
+            show_date="2026-10-10",
+            run_id="run-current",
+            previous_rows=[previous],
+        )
+        summary = payload["current"]
+        format_rows = {row["name"]: row for row in summary["tables"]["formats"]}
+        detail = next(iter(payload["details"].values()))
+
+        self.assertEqual(summary["comparison"]["previous_run"]["change_counts"]["added"], 0)
+        self.assertEqual(summary["comparison"]["previous_run"]["change_counts"]["removed"], 0)
+        self.assertEqual(detail["format"], "IMAX 3D")
+        self.assertEqual(detail["format_name"], "3D")
+        self.assertEqual(detail["format_categories_previous_run"], ["IMAX"])
+        self.assertEqual(format_rows["IMAX"]["booked_gross"], 0)
+        self.assertEqual(format_rows["IMAX"]["gross_delta_previous_run"], -100)
+        self.assertEqual(format_rows["3D"]["booked_gross"], 120)
+        self.assertEqual(format_rows["3D"]["gross_delta_previous_run"], 120)
+        self.assertEqual(summary["metrics"]["booked_gross"], 120)
+
+    def test_report_format_summary_duplicates_full_metrics_for_each_facet(self):
+        current = make_show("8:00 PM", 10, 120)
+        previous = make_show("8:00 PM", 8, 100)
+        current["format"] = previous["format"] = "IMAX 3D"
+
+        formats = build_format_summary([current], [previous])
+        self.assertEqual(formats["IMAX"]["booked_gross"], 120)
+        self.assertEqual(formats["3D"]["booked_gross"], 120)
+        self.assertEqual(formats["IMAX"]["gross_delta"], 20)
+        self.assertEqual(formats["3D"]["gross_delta"], 20)
+
+        payload = build_analytics_payload(
+            [current],
+            market_id="usa",
+            movie_id="example-film",
+            show_date="2026-10-10",
+            run_id="run-formats",
+            previous_rows=[previous],
+        )
+        database = FakeDatabase()
+        publish_analytics_payload(
+            database,
+            "usa",
+            "example-film",
+            "2026-10-10",
+            payload,
+        )
+
+        root = "markets/usa/movies/example-film/dates/2026-10-10"
+        persisted_summary = database.values[f"{root}/analytics_v2/runs/run-formats/summary"]
+        persisted_detail = database.values[
+            f"{root}/movie_details/runs/run-formats/pages/0001"
+        ]
+        detail = next(iter(persisted_detail.values()))
+        persisted_formats = {row["name"]: row for row in persisted_summary["tables"]["formats"]}
+        self.assertEqual(detail["format"], "IMAX 3D")
+        self.assertEqual(detail["format_name"], "IMAX / 3D")
+        self.assertEqual(detail["format_categories"], ["IMAX", "3D"])
+        self.assertEqual(persisted_formats["IMAX"]["booked_gross"], 120)
+        self.assertEqual(persisted_formats["3D"]["booked_gross"], 120)
 
     def test_does_not_time_match_shows_more_than_one_hour_apart(self):
         summary = self.build(
@@ -400,7 +492,7 @@ class AnalyticsV2Tests(unittest.TestCase):
                 [row["name"] for row in dimension_rows],
             )
 
-    def test_dimension_growth_uses_current_shows_only_like_legacy_reports(self):
+    def test_format_growth_compares_category_membership_without_changing_other_dimensions(self):
         current_show = make_show("8:00 PM", 20, 200)
         previous_matching_show = make_show("8:00 PM", 15, 150)
         previous_removed_show = make_show("9:00 PM", 10, 100)
@@ -427,12 +519,17 @@ class AnalyticsV2Tests(unittest.TestCase):
             daily_baseline_rows=[daily_matching_show, daily_removed_show],
         )
         summary = payload["current"]
-        for dimension in ("formats", "languages"):
-            rows = summary["tables"][dimension]
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["name"], "Standard" if dimension == "formats" else "Tamil")
-            self.assertEqual(sum(row["gross_delta_previous_run"] for row in rows), 50)
-            self.assertEqual(sum(row["gross_delta_daily_snapshot"] for row in rows), 80)
+        format_rows = summary["tables"]["formats"]
+        self.assertEqual(len(format_rows), 1)
+        self.assertEqual(format_rows[0]["name"], "Standard")
+        self.assertEqual(format_rows[0]["gross_delta_previous_run"], -50)
+        self.assertEqual(format_rows[0]["gross_delta_daily_snapshot"], 80)
+
+        language_rows = summary["tables"]["languages"]
+        self.assertEqual(len(language_rows), 1)
+        self.assertEqual(language_rows[0]["name"], "Tamil")
+        self.assertEqual(language_rows[0]["gross_delta_previous_run"], 50)
+        self.assertEqual(language_rows[0]["gross_delta_daily_snapshot"], 80)
 
     def test_publisher_writes_only_daily_snapshot_and_preserves_distinct_advance_run(self):
         database = FakeDatabase()

@@ -9,6 +9,16 @@ from datetime import date, datetime, timezone
 
 
 PAGE_SIZE = 20
+FORMAT_CATEGORIES = (
+    "IMAX",
+    "3D",
+    "Cinemark XD",
+    "RPX",
+    "Laser at AMC",
+    "Other Premium",
+    "Standard",
+)
+FORMAT_CATEGORY_IDS = {name: re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") for name in FORMAT_CATEGORIES}
 DIMENSIONS = (
     "regions",
     "states",
@@ -27,6 +37,119 @@ def _number(value):
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def classify_report_formats(value):
+    """Return the report-only screen-format facets for a raw Fandango format string."""
+    text = re.sub(r"\bD\s*-?\s*BOX\b", " ", str(value or ""), flags=re.IGNORECASE).upper()
+    categories = set()
+
+    if re.search(r"\bIMAX\b", text):
+        categories.add("IMAX")
+    if re.search(r"\b3D\b", text):
+        categories.add("3D")
+    if re.search(r"\bXD\b", text):
+        categories.add("Cinemark XD")
+    if re.search(r"\bRPX\b", text):
+        categories.add("RPX")
+    if re.search(r"\bLASER\s+AT\s+AMC\b|\bAMC\s+(?:WITH\s+)?LASER\b", text):
+        categories.add("Laser at AMC")
+
+    premium_markers = (
+        "PREMIUM",
+        "4DX",
+        "DOLBY",
+        "SCREENX",
+        "ULTRAAVX",
+        "BIGD",
+        "BIG D",
+        "LUXE",
+    )
+    has_named_premium = bool(categories.intersection({
+        "IMAX", "Cinemark XD", "RPX", "Laser at AMC"
+    }))
+    if not has_named_premium and any(marker in text for marker in premium_markers):
+        categories.add("Other Premium")
+
+    if not categories:
+        categories.add("Standard")
+    return [category for category in FORMAT_CATEGORIES if category in categories]
+
+
+def format_categories_for_show(row):
+    """Read persisted report facets or derive them from a legacy raw format value."""
+    supplied = row.get("format_categories")
+    if isinstance(supplied, str):
+        supplied = [supplied]
+    if isinstance(supplied, (list, tuple, set)):
+        allowed = set(supplied).intersection(FORMAT_CATEGORIES)
+        return [category for category in FORMAT_CATEGORIES if category in allowed]
+    return classify_report_formats(row.get("format"))
+
+
+def combine_report_format_categories(rows):
+    categories = {
+        category
+        for row in rows
+        for category in format_categories_for_show(row)
+    }
+    if not categories:
+        categories.add("Standard")
+    return [category for category in FORMAT_CATEGORIES if category in categories]
+
+
+def report_format_label(row):
+    return " / ".join(format_categories_for_show(row))
+
+
+def build_format_summary(rows, previous_rows=None):
+    """Build overlapping format facets and deltas from whole-show current/previous totals."""
+    current_by_category = defaultdict(list)
+    previous_by_category = defaultdict(list)
+
+    for source_rows, grouped in (
+        (rows or [], current_by_category),
+        (previous_rows or [], previous_by_category),
+    ):
+        for row in source_rows:
+            if row.get("is_extra") or row.get("t_id") == "EXTRA":
+                continue
+            for category in format_categories_for_show(row):
+                grouped[category].append(row)
+
+    summary = {}
+    for category in FORMAT_CATEGORIES:
+        current_rows = current_by_category.get(category, [])
+        previous_category_rows = previous_by_category.get(category, [])
+        if not current_rows and not previous_category_rows:
+            continue
+
+        def metrics(category_rows):
+            capacity = sum(_number(row.get("total", row.get("capacity_seats"))) for row in category_rows)
+            booked = sum(_number(row.get("booked", row.get("booked_tickets"))) for row in category_rows)
+            gross = sum(_number(row.get("gross", row.get("booked_gross"))) for row in category_rows)
+            return {
+                "shows": len(category_rows),
+                "capacity_seats": capacity,
+                "booked_tickets": booked,
+                "booked_gross": gross,
+                "occupancy_rate": booked / capacity * 100 if capacity else 0,
+            }
+
+        current = metrics(current_rows)
+        previous = metrics(previous_category_rows)
+        summary[category] = {
+            "name": category,
+            "show_count": current["shows"],
+            "capacity_seats": current["capacity_seats"],
+            "booked_tickets": current["booked_tickets"],
+            "booked_gross": current["booked_gross"],
+            "occupancy_rate": current["occupancy_rate"],
+            "shows_delta": current["shows"] - previous["shows"],
+            "tickets_delta": current["booked_tickets"] - previous["booked_tickets"],
+            "gross_delta": current["booked_gross"] - previous["booked_gross"],
+        }
+    return summary
 
 
 def _cumulative_metrics(date_entries, sales_scope):
@@ -273,7 +396,7 @@ def _normalized_format(value):
     return text
 
 
-def _normalize_show(row):
+def _normalize_show(row, market_id=None):
     state = row.get("state") or "Unknown"
     city = row.get("city") or "Unknown"
     theater = row.get("theater") or "Unknown"
@@ -299,6 +422,12 @@ def _normalize_show(row):
     else:
         chain = "Other / Independents"
 
+    raw_format = _normalized_format(row.get("format"))
+    format_categories = (
+        format_categories_for_show(row)
+        if market_id == "usa"
+        else [raw_format]
+    )
     return {
         "show_id": str(row.get("_analytics_show_id") or _show_id(row)),
         "theater_id": str(row.get("t_id") or theater),
@@ -313,8 +442,9 @@ def _normalize_show(row):
         "chain_name": chain,
         "platform_id": "fandango",
         "platform_name": "Fandango",
-        "format_id": _key(_normalized_format(row.get("format"))),
-        "format_name": _normalized_format(row.get("format")),
+        "format_id": _key(raw_format),
+        "format_name": " / ".join(format_categories),
+        "format_categories": format_categories,
         "language_id": _key(row.get("language")),
         "language_name": str(row.get("language") or "Unknown"),
         "time_bucket_id": _key(_time_bucket(time_value)),
@@ -391,7 +521,7 @@ def _metrics(rows):
     }
 
 
-def _aggregate(rows, comparison_rows, time_fallback_minutes=0):
+def _aggregate(rows, comparison_rows, time_fallback_minutes=0, overlapping_formats=False):
     matched_rows, removed_rows = _match_previous_rows(
         rows, comparison_rows, time_fallback_minutes
     )
@@ -409,6 +539,9 @@ def _aggregate(rows, comparison_rows, time_fallback_minutes=0):
         previous = matched_rows.get(row_index)
         row = dict(row)
         row["has_comparison"] = previous is not None
+        row["previous_format_categories"] = (
+            previous["format_categories"] if previous is not None else []
+        )
         row["gross_delta"] = row["booked_gross"] - _number(previous and previous.get("booked_gross"))
         row["tickets_delta"] = row["booked_tickets"] - _number(previous and previous.get("booked_tickets"))
         row["capacity_delta"] = row["capacity_seats"] - _number(previous and previous.get("capacity_seats"))
@@ -431,6 +564,10 @@ def _aggregate(rows, comparison_rows, time_fallback_minutes=0):
                 changes["tickets_decreased"].append(row)
 
             for dimension in DIMENSIONS:
+                if dimension == "formats" and overlapping_formats:
+                    for category in row["format_categories"]:
+                        grouped_rows[(dimension, FORMAT_CATEGORY_IDS[category])].append(row)
+                    continue
                 entity_id = row[
                     {
                         "regions": "region_id",
@@ -458,6 +595,14 @@ def _aggregate(rows, comparison_rows, time_fallback_minutes=0):
             for grouped_dimension, entity_id in grouped_rows
             if grouped_dimension == dimension
         }
+        previous_format_rows = defaultdict(list)
+        if dimension == "formats" and overlapping_formats:
+            for previous in comparison_rows:
+                if previous["is_extra"]:
+                    continue
+                for category in previous["format_categories"]:
+                    previous_format_rows[FORMAT_CATEGORY_IDS[category]].append(previous)
+            entity_ids.update(previous_format_rows)
         label_field = {
             "regions": "region_name",
             "states": "state_name",
@@ -473,6 +618,21 @@ def _aggregate(rows, comparison_rows, time_fallback_minutes=0):
             members = grouped_rows.get((dimension, entity_id), [])
             current_rows = members
             current_metrics = _metrics(current_rows)
+            if dimension == "formats" and overlapping_formats:
+                previous_metrics = _metrics(previous_format_rows.get(entity_id, []))
+                category_name = next(
+                    category for category, category_id in FORMAT_CATEGORY_IDS.items()
+                    if category_id == entity_id
+                )
+                current_metrics.update({
+                    "id": entity_id,
+                    "name": category_name,
+                    "gross_delta": current_metrics["booked_gross"] - previous_metrics["booked_gross"],
+                    "tickets_delta": current_metrics["booked_tickets"] - previous_metrics["booked_tickets"],
+                    "shows_delta": current_metrics["show_count"] - previous_metrics["show_count"],
+                })
+                dimensions[dimension][entity_id] = current_metrics
+                continue
             current_metrics.update({
                 "id": entity_id,
                 "name": current_rows[0][label_field],
@@ -505,15 +665,18 @@ def build_analytics_payload(
 ):
     """Build complete summary rollups and paged details for one immutable run."""
     observed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    normalized = [_normalize_show(row) for row in rows]
-    previous_normalized = [_normalize_show(row) for row in (previous_rows or [])]
-    daily_normalized = [_normalize_show(row) for row in (daily_baseline_rows or [])]
+    overlapping_formats = market_id == "usa"
+    normalized = [_normalize_show(row, market_id) for row in rows]
+    previous_normalized = [_normalize_show(row, market_id) for row in (previous_rows or [])]
+    daily_normalized = [_normalize_show(row, market_id) for row in (daily_baseline_rows or [])]
 
     current_shows, dimensions, previous_changes = _aggregate(
-        normalized, previous_normalized, time_fallback_minutes=60
+        normalized, previous_normalized, time_fallback_minutes=60,
+        overlapping_formats=overlapping_formats,
     )
     daily_shows, daily_dimensions, daily_changes = _aggregate(
-        normalized, daily_normalized, time_fallback_minutes=60
+        normalized, daily_normalized, time_fallback_minutes=60,
+        overlapping_formats=overlapping_formats,
     )
     metrics = _metrics(normalized)
     previous_metrics = _metrics(previous_normalized)
@@ -568,10 +731,17 @@ def build_analytics_payload(
     details = {}
     for show_id, current_row in current_shows.items():
         daily_row = daily_shows.get(show_id)
+        detail = raw_details.get(show_id, {})
+        detail["format_name"] = current_row["format_name"]
+        detail["format_categories"] = current_row["format_categories"]
         details[show_id] = {
-            **raw_details.get(show_id, {}),
+            **detail,
             "gross_delta_previous_run": current_row["growth_gross_delta"],
             "tickets_delta_previous_run": current_row["growth_tickets_delta"],
+            "format_categories_previous_run": current_row["previous_format_categories"],
+            "format_categories_daily_snapshot": (
+                daily_row["previous_format_categories"] if daily_row else []
+            ),
             "gross_delta_daily_snapshot": (
                 daily_row["growth_gross_delta"] if daily_row else current_row["booked_gross"]
             ),
@@ -629,12 +799,15 @@ def build_analytics_payload(
         "comparison_baseline": {
             "shows": {
                 show_id: {
-                    key: raw_row[key]
-                    for key in (
-                        "state", "t_id", "theater", "format", "language", "time",
-                        "status", "price_str", "total", "booked", "gross", "is_extra",
-                    )
-                    if key in raw_row
+                    **{
+                        key: raw_row[key]
+                        for key in (
+                            "state", "t_id", "theater", "format", "language", "time",
+                            "status", "price_str", "total", "booked", "gross", "is_extra",
+                        )
+                        if key in raw_row
+                    },
+                    "format_categories": normalized_row["format_categories"],
                 }
                 for raw_row, normalized_row in zip(rows, normalized)
                 if not normalized_row["is_extra"]
@@ -642,12 +815,14 @@ def build_analytics_payload(
             },
             "extras": [
                 {
-                    key: raw_row[key]
-                    for key in (
-                        "state", "t_id", "theater", "format", "language", "time",
-                        "status", "price_str", "total", "booked", "gross", "is_extra",
-                    )
-                    if key in raw_row
+                    **{
+                        key: raw_row[key]
+                        for key in (
+                            "state", "t_id", "theater", "format", "language", "time",
+                            "status", "price_str", "total", "booked", "gross", "is_extra",
+                        )
+                        if key in raw_row
+                    },
                 }
                 for raw_row, normalized_row in zip(rows, normalized)
                 if normalized_row["is_extra"]
