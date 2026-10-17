@@ -102,6 +102,7 @@ URL = MOVIE_CONFIG["movie_url"]
 AVG_PRICE = float(MOVIE_CONFIG["average_price"])
 MAX_TIER_PRICE = float(MOVIE_CONFIG["max_price"])
 DEFAULT_LANGUAGE = MOVIE_CONFIG["default_language"]
+SUPPORTED_LANGUAGES = ("TELUGU", "HINDI", "TAMIL", "MALAYALAM", "KANNADA", "ENGLISH")
 EXTRA = MOVIE_CONFIG.get("extra", [])
 MANUAL_SHOWS = [EXTRA] if EXTRA else []
 MOVIE_METADATA = {
@@ -110,6 +111,19 @@ MOVIE_METADATA = {
 }
 
 EXTRA_GROSS_NOTE = "Added extra gross for offline fans sold-out shows!"
+
+
+def detect_show_language(amenities, default_language):
+    language_pattern = re.compile(
+        rf"^\s*({'|'.join(SUPPORTED_LANGUAGES)})\s+(?:WITH\b|LANGUAGE\b)",
+        re.IGNORECASE,
+    )
+    for amenity in amenities:
+        match = language_pattern.match(str(amenity))
+        if match:
+            return match.group(1).title()
+    return default_language
+
 
 # =============================================================================
 
@@ -257,14 +271,8 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                                 show_format = am_name
                                 break
                         
-                        # 3. Extract Language purely for your Excel reports
-                        show_language = DEFAULT_LANGUAGE
-                        language_keywords = ["TELUGU", "HINDI", "TAMIL", "MALAYALAM", "KANNADA"]
-                        for am_up in raw_amenities_upper:
-                            for lang in language_keywords:
-                                if lang in am_up and show_language == DEFAULT_LANGUAGE:
-                                    show_language = lang.capitalize()
-                                    break
+                        # Recognize supported languages only before "with" or "Language".
+                        show_language = detect_show_language(raw_amenities, DEFAULT_LANGUAGE)
                         
                         # 4. THE AMENITY SIGNATURE (The Master Grouper)
                         signature_amenities = [a for a in raw_amenities_upper if "D-BOX" not in a and "DBOX" not in a and "RESERVED" not in a and "RECLINERS" not in a]
