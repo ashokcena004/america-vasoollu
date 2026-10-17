@@ -9,16 +9,23 @@ from datetime import date, datetime, timezone
 
 
 PAGE_SIZE = 20
-FORMAT_CATEGORIES = (
+
+DESIRED_REPORT_FORMATS = [
     "IMAX",
     "3D",
     "Cinemark XD",
     "RPX",
     "Laser at AMC",
+]
+
+FORMAT_CATEGORIES = (
+    *DESIRED_REPORT_FORMATS,
     "Other Premium",
     "Standard",
 )
+
 FORMAT_CATEGORY_IDS = {name: re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") for name in FORMAT_CATEGORIES}
+
 DIMENSIONS = (
     "regions",
     "states",
@@ -39,41 +46,25 @@ def _number(value):
         return 0.0
 
 
-def classify_report_formats(value):
-    """Return the report-only screen-format facets for a raw Fandango format string."""
-    text = re.sub(r"\bD\s*-?\s*BOX\b", " ", str(value or ""), flags=re.IGNORECASE).upper()
-    categories = set()
-
-    if re.search(r"\bIMAX\b", text):
-        categories.add("IMAX")
-    if re.search(r"\b3D\b", text):
-        categories.add("3D")
-    if re.search(r"\bXD\b", text):
-        categories.add("Cinemark XD")
-    if re.search(r"\bRPX\b", text):
-        categories.add("RPX")
-    if re.search(r"\bLASER\s+AT\s+AMC\b|\bAMC\s+(?:WITH\s+)?LASER\b", text):
-        categories.add("Laser at AMC")
-
-    premium_markers = (
-        "PREMIUM",
-        "4DX",
-        "DOLBY",
-        "SCREENX",
-        "ULTRAAVX",
-        "BIGD",
-        "BIG D",
-        "LUXE",
-    )
-    has_named_premium = bool(categories.intersection({
-        "IMAX", "Cinemark XD", "RPX", "Laser at AMC"
-    }))
-    if not has_named_premium and any(marker in text for marker in premium_markers):
-        categories.add("Other Premium")
+def classify_report_formats(value, base_format=None):
+    """Classify report facets, using the base format only when no named format matches."""
+    text = str(value or "").casefold().replace("d-box", " ").replace("dbox", " ")
+    categories = [
+        report_format
+        for report_format in DESIRED_REPORT_FORMATS
+        if report_format.casefold() in text
+    ]
 
     if not categories:
-        categories.add("Standard")
-    return [category for category in FORMAT_CATEGORIES if category in categories]
+        base_text = str((value if base_format is None else base_format) or "").strip()
+        base_text = base_text.casefold().replace(" format", "").replace("d-box", "").replace("dbox", "").strip()
+        categories.append(
+            "Standard"
+            if not base_text or base_text == "standard"
+            else "Other Premium"
+        )
+
+    return categories
 
 
 def format_categories_for_show(row):
@@ -150,6 +141,52 @@ def build_format_summary(rows, previous_rows=None):
             "gross_delta": current["booked_gross"] - previous["booked_gross"],
         }
     return summary
+
+
+def build_combined_format_summary(rows, previous_rows=None):
+    """Build mutually exclusive rows for each exact combination of format facets."""
+    current_by_combination = defaultdict(list)
+    previous_by_combination = defaultdict(list)
+
+    def metrics(group):
+        capacity = sum(_number(row.get("capacity_seats", row.get("total"))) for row in group)
+        booked = sum(_number(row.get("booked_tickets", row.get("booked"))) for row in group)
+        gross = sum(_number(row.get("booked_gross", row.get("gross"))) for row in group)
+        return {
+            "show_count": len(group),
+            "theater_count": len({
+                str(row.get("theater_id") or row.get("t_id") or row.get("theater") or "Unknown")
+                for row in group
+            }),
+            "capacity_seats": capacity,
+            "booked_tickets": booked,
+            "booked_gross": gross,
+            "occupancy_rate": booked / capacity * 100 if capacity else 0,
+        }
+
+    for source_rows, grouped in (
+        (rows or [], current_by_combination),
+        (previous_rows or [], previous_by_combination),
+    ):
+        for row in source_rows:
+            if row.get("is_extra") or row.get("t_id") == "EXTRA":
+                continue
+            combination = " / ".join(format_categories_for_show(row))
+            grouped[combination].append(row)
+
+    result = []
+    for combination in current_by_combination.keys() | previous_by_combination.keys():
+        current = metrics(current_by_combination.get(combination, []))
+        previous = metrics(previous_by_combination.get(combination, []))
+        result.append({
+            "id": _key(combination),
+            "name": combination,
+            **current,
+            "gross_delta": current["booked_gross"] - previous["booked_gross"],
+            "tickets_delta": current["booked_tickets"] - previous["booked_tickets"],
+            "shows_delta": current["show_count"] - previous["show_count"],
+        })
+    return sorted(result, key=lambda item: (-item["booked_gross"], item["id"]))
 
 
 def _cumulative_metrics(date_entries, sales_scope):
@@ -714,6 +751,48 @@ def build_analytics_payload(
         tables[dimension] = sorted(
             rows_by_id,
             key=lambda item: (-item["booked_gross"], item["id"]),
+        )
+    if overlapping_formats:
+        combined_current = {
+            item["id"]: item
+            for item in build_combined_format_summary(normalized)
+        }
+        combined_previous = {
+            item["id"]: item
+            for item in build_combined_format_summary(normalized, previous_normalized)
+        }
+        combined_daily = {
+            item["id"]: item
+            for item in build_combined_format_summary(normalized, daily_normalized)
+        }
+        combination_ids = (
+            combined_current.keys()
+            | combined_previous.keys()
+            | combined_daily.keys()
+        )
+        combination_names = {
+            item["id"]: item["name"]
+            for source in (combined_current, combined_previous, combined_daily)
+            for item in source.values()
+        }
+        tables["format_combinations"] = [
+            {
+                **combined_current.get(combination_id, {
+                    "id": combination_id,
+                    "name": combination_names[combination_id],
+                    **_metrics([]),
+                }),
+                "gross_delta_previous_run": combined_previous.get(combination_id, {}).get("gross_delta", 0),
+                "tickets_delta_previous_run": combined_previous.get(combination_id, {}).get("tickets_delta", 0),
+                "shows_delta_previous_run": combined_previous.get(combination_id, {}).get("shows_delta", 0),
+                "gross_delta_daily_snapshot": combined_daily.get(combination_id, {}).get("gross_delta", 0),
+                "tickets_delta_daily_snapshot": combined_daily.get(combination_id, {}).get("tickets_delta", 0),
+                "shows_delta_daily_snapshot": combined_daily.get(combination_id, {}).get("shows_delta", 0),
+            }
+            for combination_id in combination_ids
+        ]
+        tables["format_combinations"].sort(
+            key=lambda item: (-item["booked_gross"], item["id"])
         )
     raw_details = {
         normalized_row["show_id"]: {

@@ -279,7 +279,8 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         # Recognize supported languages only before "with" or "Language".
                         show_language = detect_show_language(raw_amenities, DEFAULT_LANGUAGE)
                         report_format_categories = classify_report_formats(
-                            " ".join([raw_header, show_format, *raw_amenities])
+                            " ".join([raw_header, show_format, *raw_amenities]),
+                            base_format=base_format,
                         )
                         if is_dbox and report_format_categories == ["Standard"]:
                             report_format_categories = []

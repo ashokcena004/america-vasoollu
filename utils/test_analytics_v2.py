@@ -3,6 +3,7 @@ from copy import deepcopy
 
 from utils.analytics_v2 import (
     build_analytics_payload,
+    build_combined_format_summary,
     build_format_summary,
     classify_report_formats,
     combine_report_format_categories,
@@ -109,6 +110,18 @@ class AnalyticsV2Tests(unittest.TestCase):
         self.assertEqual(classify_report_formats("4DX"), ["Other Premium"])
         self.assertEqual(classify_report_formats("D-BOX"), ["Standard"])
         self.assertEqual(
+            classify_report_formats("4DX amenity", base_format="Standard"),
+            ["Standard"],
+        )
+        self.assertEqual(
+            classify_report_formats("unlisted format", base_format="Premium"),
+            ["Other Premium"],
+        )
+        self.assertEqual(
+            classify_report_formats("unknown amenity", base_format="Laser"),
+            ["Other Premium"],
+        )
+        self.assertEqual(
             combine_report_format_categories([
                 {"format": "Cinemark XD", "format_categories": ["Cinemark XD"]},
                 {"format": "D-BOX", "format_categories": []},
@@ -186,6 +199,42 @@ class AnalyticsV2Tests(unittest.TestCase):
         self.assertEqual(detail["format_categories"], ["IMAX", "3D"])
         self.assertEqual(persisted_formats["IMAX"]["booked_gross"], 120)
         self.assertEqual(persisted_formats["3D"]["booked_gross"], 120)
+
+    def test_combined_format_summary_groups_exact_combinations_once(self):
+        current_imax_3d = make_show("8:00 PM", 10, 120)
+        current_imax = make_show("9:00 PM", 5, 60)
+        previous_imax_3d = make_show("8:00 PM", 8, 100)
+        for show in (current_imax_3d, previous_imax_3d):
+            show["format"] = "IMAX 3D"
+        current_imax["format"] = "IMAX"
+
+        combinations = {
+            row["name"]: row
+            for row in build_combined_format_summary(
+                [current_imax_3d, current_imax],
+                [previous_imax_3d],
+            )
+        }
+        self.assertEqual(combinations["IMAX / 3D"]["show_count"], 1)
+        self.assertEqual(combinations["IMAX / 3D"]["booked_gross"], 120)
+        self.assertEqual(combinations["IMAX / 3D"]["gross_delta"], 20)
+        self.assertEqual(combinations["IMAX"]["show_count"], 1)
+        self.assertEqual(combinations["IMAX"]["booked_gross"], 60)
+
+        payload = build_analytics_payload(
+            [current_imax_3d, current_imax],
+            market_id="usa",
+            movie_id="example-film",
+            show_date="2026-10-10",
+            run_id="run-combinations",
+            previous_rows=[previous_imax_3d],
+        )
+        combined_rows = {
+            row["name"]: row
+            for row in payload["current"]["tables"]["format_combinations"]
+        }
+        self.assertEqual(combined_rows["IMAX / 3D"]["gross_delta_previous_run"], 20)
+        self.assertEqual(combined_rows["IMAX"]["gross_delta_previous_run"], 60)
 
     def test_does_not_time_match_shows_more_than_one_hour_apart(self):
         summary = self.build(
