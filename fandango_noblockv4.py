@@ -33,9 +33,15 @@ from utils.generateFandangoImageReport import generate_fandango_image_report
 # ── 1. CONFIGURATION ─────────────────────────────────────────────────────────
 # =============================================================================
 
-SHOW_DATE = "2026-11-04"
+SHOW_DATE = "2026-10-17"
+GLOBAL_MOVIE_SLUG = "jailer-2"
 
-GLOBAL_MOVIE_SLUG = "ramayana"
+FANDANGO_SCRAPE_QUEUE = [
+    ("jailer-2", "2026-10-17"),
+    ("ramayana", "2026-11-04"),
+]
+FANDANGO_QUEUE_ENABLED = os.getenv("FANDANGO_QUEUE_ENABLED", "false").lower() == "true"
+FANDANGO_QUEUE_NEXT_INDEX = None
 
 
 FORCE_UPDATE_ADVANCE = False
@@ -100,6 +106,43 @@ def load_movie_config(config_path, global_slug):
         )
 
     return movie_config
+
+
+if FANDANGO_QUEUE_ENABLED:
+    firebase_creds_json = os.environ.get("FIREBASE_CREDENTIALS")
+    firebase_creds_file = os.environ.get("FIREBASE_CREDENTIALS_FILE")
+    firebase_db_url = os.environ.get("FIREBASE_DATABASE_URL")
+    if (not firebase_creds_json and not firebase_creds_file) or not firebase_db_url:
+        raise RuntimeError("Firebase credentials and database URL are required for queue mode.")
+    if not firebase_admin._apps:
+        if firebase_creds_json:
+            queue_creds_dict = json.loads(firebase_creds_json)
+        else:
+            with open(firebase_creds_file, "r", encoding="utf-8") as credentials_file:
+                queue_creds_dict = json.load(credentials_file)
+        firebase_admin.initialize_app(
+            credentials.Certificate(queue_creds_dict),
+            {"databaseURL": firebase_db_url},
+        )
+
+    queue_index = db.reference("fandango_cron_currentindex").get()
+    if queue_index is None:
+        queue_index = 0
+    elif type(queue_index) is not int:
+        raise ValueError(
+            "Firebase fandango_cron_currentindex must be an integer or null."
+        )
+    if not FANDANGO_SCRAPE_QUEUE:
+        raise ValueError("FANDANGO_SCRAPE_QUEUE must contain at least one entry.")
+    if queue_index < 0 or queue_index >= len(FANDANGO_SCRAPE_QUEUE):
+        queue_index = 0
+
+    GLOBAL_MOVIE_SLUG, SHOW_DATE = FANDANGO_SCRAPE_QUEUE[queue_index]
+    FANDANGO_QUEUE_NEXT_INDEX = queue_index + 1
+    print(
+        f"📋 Queue item {queue_index + 1}/{len(FANDANGO_SCRAPE_QUEUE)}: "
+        f"{GLOBAL_MOVIE_SLUG} on {SHOW_DATE}"
+    )
 
 
 MOVIE_CONFIG = load_movie_config(MOVIE_CONFIG_PATH, GLOBAL_MOVIE_SLUG)
@@ -1832,8 +1875,13 @@ if __name__ == "__main__":
                 raise
 
         pipeline_elapsed = time.time() - PIPELINE_START_TIME
+        if FANDANGO_QUEUE_ENABLED:
+            db.reference("fandango_cron_currentindex").set(FANDANGO_QUEUE_NEXT_INDEX)
+            print(f"✅ Queue cursor advanced to {FANDANGO_QUEUE_NEXT_INDEX}.")
         mins, secs = divmod(pipeline_elapsed, 60)
         print(f"🎉 Pipeline completely finished in {int(mins)} minutes and {int(secs)} seconds. No local files saved!")
 
     else:
         print("❌ No successful showtime seat maps were fetched across any state.")
+        if FANDANGO_QUEUE_ENABLED:
+            raise RuntimeError("Queue item was not advanced because no showtime seat maps were fetched.")

@@ -13,7 +13,7 @@ permissions:
 
 concurrency:
   group: fandango-global
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   scrape-and-upload:
@@ -52,6 +52,7 @@ jobs:
           INR_TO_USD: ${{ secrets.INR_TO_USD }}
           OVERWRITE_SNAPSHOT: "false"
           PLAYWRIGHT_BROWSER_TRACKING: "1"
+          FANDANGO_QUEUE_ENABLED: "true"
         run: |
           python fandango_noblockv4.py
 
