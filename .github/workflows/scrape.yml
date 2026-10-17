@@ -52,7 +52,6 @@ jobs:
           INR_TO_USD: ${{ secrets.INR_TO_USD }}
           OVERWRITE_SNAPSHOT: "false"
           PLAYWRIGHT_BROWSER_TRACKING: "1"
-          FANDANGO_QUEUE_ENABLED: "true"
         run: |
           python fandango_noblockv4.py
 
