@@ -4,6 +4,7 @@ from datetime import date, datetime, timezone
 
 from build_portal_views import (
     _build_global_portal,
+    _build_trajectory,
     _lifecycle_rollup,
     _market_today,
     _apply_matching_advance_occupancy,
@@ -33,6 +34,33 @@ class FakeDatabase:
 
 
 class PortalLifecycleTests(unittest.TestCase):
+    def test_trajectory_keeps_each_show_date_observation_timestamp(self):
+        dates = {
+            "2026-10-12": {"current": {"booked_gross": 100}},
+            "2026-10-13": {"current": {"booked_gross": 200}},
+        }
+        summaries = {
+            "2026-10-12": {"observed_at": "2026-10-12T08:00:00Z"},
+            "2026-10-13": {"observed_at": "2026-10-13T09:30:00Z"},
+        }
+        date_index = {
+            "2026-10-12": {"has_current": True},
+            "2026-10-13": {"has_current": True},
+        }
+
+        trajectory = _build_trajectory(
+            dates,
+            summaries,
+            date_index,
+            "current",
+            date(2026, 10, 13),
+        )
+
+        self.assertEqual(
+            [point["observed_at"] for point in trajectory],
+            ["2026-10-12T08:00:00Z", "2026-10-13T09:30:00Z"],
+        )
+
     def test_latest_observed_at_uses_timestamp_order_across_timezones(self):
         observed_at = _latest_observed_at(
             {
@@ -159,6 +187,7 @@ class PortalLifecycleTests(unittest.TestCase):
         database.values[
             f"{movie_root}/dates/{date_key}/analytics_v2/runs/{run_id}/summary"
         ] = {
+            "observed_at": "2026-10-13T08:45:00Z",
             "metrics": {
                 "booked_gross": 1000,
                 "booked_tickets": 10,
@@ -191,6 +220,14 @@ class PortalLifecycleTests(unittest.TestCase):
             [date_key],
         )
         self.assertEqual(summary["daily_trajectory_current"][0]["daily_gross"], 1000)
+        self.assertEqual(
+            summary["daily_trajectory_current"][0]["observed_at"],
+            "2026-10-13T08:45:00Z",
+        )
+        self.assertEqual(
+            summary["daily_trajectory_advance"][0]["observed_at"],
+            "2026-10-13T08:45:00Z",
+        )
         self.assertTrue(summary["date_index"][date_key]["has_current"])
         self.assertTrue(summary["date_index"][date_key]["has_advance"])
 

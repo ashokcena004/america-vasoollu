@@ -498,6 +498,9 @@ def _build_trajectory(
             "capacity_seats": _integer(metrics.get("capacity_seats")),
             "occupancy": _occupancy(metrics),
         }
+        observed_at = _as_dict(summaries.get(show_date)).get("observed_at")
+        if observed_at:
+            point["observed_at"] = observed_at
         if scope == "advance":
             point["advance_gross"] = daily_gross
         trajectory.append(point)
