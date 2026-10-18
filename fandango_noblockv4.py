@@ -34,7 +34,7 @@ from utils.generateFandangoImageReport import generate_fandango_image_report
 # =============================================================================
 
 FANDANGO_SCRAPE_QUEUE = [
-    ("jailer-2", "2026-10-17"),
+    ("jailer-2", "2026-10-18"),
     ("ramayana", "2026-11-04"),
 ]
 FANDANGO_QUEUE_NEXT_INDEX = None
