@@ -33,10 +33,6 @@ from utils.generateFandangoImageReport import generate_fandango_image_report
 # ── 1. CONFIGURATION ─────────────────────────────────────────────────────────
 # =============================================================================
 
-FANDANGO_SCRAPE_QUEUE = [
-    ("jailer-2", "2026-10-18"),
-    ("ramayana", "2026-11-04"),
-]
 FANDANGO_QUEUE_NEXT_INDEX = None
 
 
@@ -50,6 +46,42 @@ IGNORE_SOLDOUT_CHAINS = [] #Eg: AMC
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MOVIE_CONFIG_PATH = os.path.join(SCRIPT_DIR, "data", "movie_config.json")
+FANDANGO_QUEUE_PATH = os.path.join(SCRIPT_DIR, "data", "fandango_scrape_queue.json")
+
+def load_fandango_scrape_queue(queue_path):
+    try:
+        with open(queue_path, "r", encoding="utf-8") as queue_file:
+            queue_config = json.load(queue_file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not load Fandango scrape queue at {queue_path}.") from exc
+
+    if not isinstance(queue_config, dict) or not isinstance(queue_config.get("queue"), list):
+        raise ValueError(
+            f"Fandango scrape queue must be an object containing a 'queue' list: {queue_path}"
+        )
+
+    scrape_queue = []
+    for index, item in enumerate(queue_config["queue"]):
+        if not isinstance(item, dict):
+            raise ValueError(f"Queue item {index + 1} must be an object.")
+        global_slug = item.get("global_slug")
+        show_date = item.get("show_date")
+        if not isinstance(global_slug, str) or not global_slug.strip():
+            raise ValueError(f"Queue item {index + 1} must provide a non-empty 'global_slug'.")
+        if not isinstance(show_date, str):
+            raise ValueError(f"Queue item {index + 1} must provide 'show_date' in YYYY-MM-DD format.")
+        try:
+            parsed_show_date = datetime.strptime(show_date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError(
+                f"Queue item {index + 1} has an invalid 'show_date': {show_date!r}."
+            ) from exc
+        if parsed_show_date.strftime("%Y-%m-%d") != show_date:
+            raise ValueError(
+                f"Queue item {index + 1} has an invalid 'show_date': {show_date!r}."
+            )
+        scrape_queue.append((global_slug.strip(), show_date))
+    return scrape_queue
 
 def load_movie_config(config_path, global_slug):
     try:
@@ -103,6 +135,8 @@ def load_movie_config(config_path, global_slug):
 
     return movie_config
 
+
+FANDANGO_SCRAPE_QUEUE = load_fandango_scrape_queue(FANDANGO_QUEUE_PATH)
 
 if not FANDANGO_SCRAPE_QUEUE:
     print("ℹ️ FANDANGO_SCRAPE_QUEUE is empty; skipping scraper.")
