@@ -35,13 +35,6 @@ from utils.generateFandangoImageReport import generate_fandango_image_report
 
 FANDANGO_QUEUE_NEXT_INDEX = None
 
-
-FORCE_UPDATE_ADVANCE = True
-
-# 🚫 IGNORE SOLD OUT SHOWS FOR SPECIFIC CHAINS
-# If a show at these chains is "Sold Out", its tickets and gross will be zeroed out.
-IGNORE_SOLDOUT_CHAINS = ["AMC"] #Eg: AMC
-
 # =============================================================================
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -118,6 +111,21 @@ def load_movie_config(config_path, global_slug):
                 f"Movie configuration field {field!r} for {global_slug!r} "
                 "must be a string."
             )
+    force_update_advance = movie_config.get("force_update_advance", False)
+    if not isinstance(force_update_advance, bool):
+        raise ValueError(
+            f"Movie configuration field 'force_update_advance' for {global_slug!r} "
+            "must be a boolean."
+        )
+    ignore_soldout_chains = movie_config.get("ignore_soldout_chains", [])
+    if not isinstance(ignore_soldout_chains, list) or any(
+        not isinstance(chain, str) or not chain.strip()
+        for chain in ignore_soldout_chains
+    ):
+        raise ValueError(
+            f"Movie configuration field 'ignore_soldout_chains' for {global_slug!r} "
+            "must be a list of non-empty strings."
+        )
     extra = movie_config.get("extra", [])
     if not isinstance(extra, list):
         raise ValueError(
@@ -181,6 +189,8 @@ URL = MOVIE_CONFIG["movie_url"]
 AVG_PRICE = float(MOVIE_CONFIG["average_price"])
 MAX_TIER_PRICE = float(MOVIE_CONFIG["max_price"])
 DEFAULT_LANGUAGE = MOVIE_CONFIG["default_language"]
+FORCE_UPDATE_ADVANCE = MOVIE_CONFIG.get("force_update_advance", False)
+IGNORE_SOLDOUT_CHAINS = MOVIE_CONFIG.get("ignore_soldout_chains", [])
 SUPPORTED_LANGUAGES = ("TELUGU", "HINDI", "TAMIL", "MALAYALAM", "KANNADA", "ENGLISH")
 EXTRA = MOVIE_CONFIG.get("extra", [])
 MANUAL_SHOWS = [EXTRA] if EXTRA else []
