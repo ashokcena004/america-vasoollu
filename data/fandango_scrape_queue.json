@@ -2,11 +2,13 @@
   "queue": [
     {
       "global_slug": "jailer-2",
-      "show_date": "2026-10-19"
+      "show_date": "2026-10-19",
+      "force_update_advance": false
     },
     {
       "global_slug": "ramayana",
-      "show_date": "2026-11-04"
+      "show_date": "2026-11-04",
+      "force_update_advance": false
     }
   ]
 }

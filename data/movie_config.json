@@ -7,7 +7,6 @@
     "poster_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSAT86_NaAaV-y8qwHz5J6_nngKRnoiyTlDJ2_E7IvjwgAMi3nEfVVwrA-x&s=10",
     "cover_url": "https://images.ctfassets.net/0scfp84lysj4/5dIBtestjrz9G5hvVDnIW8/551596f383ebae36e915f19eb698a2b2/teqjvs_BACKDROP_2_1080px.jpg",
     "release_date": "2026-10-14",
-    "force_update_advance": false,
     "ignore_soldout_chains": [],
     "extra": []
   },
@@ -20,7 +19,6 @@
     "poster_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRBfalsoCg8tQK_vrqtrWV6-ABLukoy5dVQYu1kNOfSYa6H0-SxLoGZDnU&s=10",
     "cover_url": "https://m.media-amazon.com/images/M/MV5BODRjNWFlMjUtYzFhNy00ZGNmLTgxYzktMGViMTMxN2RjODIwXkEyXkFqcGc@._V1_.jpg",
     "release_date": "2026-11-04",
-    "force_update_advance": false,
     "ignore_soldout_chains": ["AMC"],
     "extra": []
   }

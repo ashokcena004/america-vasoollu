@@ -59,8 +59,13 @@ def load_fandango_scrape_queue(queue_path):
             raise ValueError(f"Queue item {index + 1} must be an object.")
         global_slug = item.get("global_slug")
         show_date = item.get("show_date")
+        force_update_advance = item.get("force_update_advance", False)
         if not isinstance(global_slug, str) or not global_slug.strip():
             raise ValueError(f"Queue item {index + 1} must provide a non-empty 'global_slug'.")
+        if not isinstance(force_update_advance, bool):
+            raise ValueError(
+                f"Queue item {index + 1} field 'force_update_advance' must be a boolean."
+            )
         if not isinstance(show_date, str):
             raise ValueError(f"Queue item {index + 1} must provide 'show_date' in YYYY-MM-DD format.")
         try:
@@ -73,7 +78,7 @@ def load_fandango_scrape_queue(queue_path):
             raise ValueError(
                 f"Queue item {index + 1} has an invalid 'show_date': {show_date!r}."
             )
-        scrape_queue.append((global_slug.strip(), show_date))
+        scrape_queue.append((global_slug.strip(), show_date, force_update_advance))
     return scrape_queue
 
 def load_movie_config(config_path, global_slug):
@@ -111,12 +116,6 @@ def load_movie_config(config_path, global_slug):
                 f"Movie configuration field {field!r} for {global_slug!r} "
                 "must be a string."
             )
-    force_update_advance = movie_config.get("force_update_advance", False)
-    if not isinstance(force_update_advance, bool):
-        raise ValueError(
-            f"Movie configuration field 'force_update_advance' for {global_slug!r} "
-            "must be a boolean."
-        )
     ignore_soldout_chains = movie_config.get("ignore_soldout_chains", [])
     if not isinstance(ignore_soldout_chains, list) or any(
         not isinstance(chain, str) or not chain.strip()
@@ -176,7 +175,7 @@ elif type(queue_index) is not int:
 if queue_index < 0 or queue_index >= len(FANDANGO_SCRAPE_QUEUE):
     queue_index = 0
 
-GLOBAL_MOVIE_SLUG, SHOW_DATE = FANDANGO_SCRAPE_QUEUE[queue_index]
+GLOBAL_MOVIE_SLUG, SHOW_DATE, FORCE_UPDATE_ADVANCE = FANDANGO_SCRAPE_QUEUE[queue_index]
 FANDANGO_QUEUE_NEXT_INDEX = queue_index + 1
 print(
     f"📋 Queue item {queue_index + 1}/{len(FANDANGO_SCRAPE_QUEUE)}: "
@@ -189,7 +188,6 @@ URL = MOVIE_CONFIG["movie_url"]
 AVG_PRICE = float(MOVIE_CONFIG["average_price"])
 MAX_TIER_PRICE = float(MOVIE_CONFIG["max_price"])
 DEFAULT_LANGUAGE = MOVIE_CONFIG["default_language"]
-FORCE_UPDATE_ADVANCE = MOVIE_CONFIG.get("force_update_advance", False)
 IGNORE_SOLDOUT_CHAINS = MOVIE_CONFIG.get("ignore_soldout_chains", [])
 SUPPORTED_LANGUAGES = ("TELUGU", "HINDI", "TAMIL", "MALAYALAM", "KANNADA", "ENGLISH")
 EXTRA = MOVIE_CONFIG.get("extra", [])
