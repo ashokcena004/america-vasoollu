@@ -36,7 +36,7 @@ from utils.generateFandangoImageReport import generate_fandango_image_report
 FANDANGO_QUEUE_NEXT_INDEX = None
 
 
-FORCE_UPDATE_ADVANCE = False
+FORCE_UPDATE_ADVANCE = True
 
 # 🚫 IGNORE SOLD OUT SHOWS FOR SPECIFIC CHAINS
 # If a show at these chains is "Sold Out", its tickets and gross will be zeroed out.
