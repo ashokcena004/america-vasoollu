@@ -3,7 +3,7 @@
     {
       "global_slug": "jailer-2",
       "show_date": "2026-10-20",
-      "force_update_advance": true
+      "force_update_advance": false
     },
     {
       "global_slug": "ramayana",
