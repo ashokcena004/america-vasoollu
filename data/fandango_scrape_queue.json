@@ -2,8 +2,8 @@
   "queue": [
     {
       "global_slug": "jailer-2",
-      "show_date": "2026-10-19",
-      "force_update_advance": false
+      "show_date": "2026-10-20",
+      "force_update_advance": true
     },
     {
       "global_slug": "ramayana",
