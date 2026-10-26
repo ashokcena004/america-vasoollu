@@ -21,5 +21,17 @@
     "release_date": "2026-11-04",
     "ignore_soldout_chains": ["AMC"],
     "extra": []
+  },
+
+  "aadarsha-kutumbam-house-no-47": {
+    "movie_url": "https://www.fandango.com/aadarsha-kutumbam-house-no-47-ak47-247720/movie-overview",
+    "average_price": 22.0,
+    "max_price": 22.0,
+    "default_language": "Telugu",
+    "poster_url": "https://in.bmscdn.com/events/moviecard/ET00475942.jpg",
+    "cover_url": "https://assets-in.bmscdn.com/discovery-catalog/events/et00475942-sxtgavdbzp-landscape.jpg",
+    "release_date": "2026-10-30",
+    "ignore_soldout_chains": ["AMC"],
+    "extra": []
   }
 }
