@@ -33,5 +33,17 @@
     "release_date": "2026-10-30",
     "ignore_soldout_chains": ["AMC"],
     "extra": []
+  },
+
+  "scene": {
+    "movie_url": "https://www.fandango.com/scene-2026-248114/movie-overview",
+    "average_price": 20.0,
+    "max_price": 20.0,
+    "default_language": "Tamil",
+    "poster_url": "https://m.media-amazon.com/images/M/MV5BOGExMjg5N2ItYmQ2NC00YjhjLTk3MWQtYTI5MDE5NWNkZjE1XkEyXkFqcGc@._V1_.jpg",
+    "cover_url": "https://www.keralatv.in/media/2026/10/Aathi-Iva-Yarraa.jpg",
+    "release_date": "2026-11-06",
+    "ignore_soldout_chains": ["AMC"],
+    "extra": []
   }
 }
