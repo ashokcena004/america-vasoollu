@@ -40,8 +40,8 @@
     "average_price": 20.0,
     "max_price": 20.0,
     "default_language": "Tamil",
-    "poster_url": "https://m.media-amazon.com/images/M/MV5BOGExMjg5N2ItYmQ2NC00YjhjLTk3MWQtYTI5MDE5NWNkZjE1XkEyXkFqcGc@._V1_.jpg",
-    "cover_url": "https://www.keralatv.in/media/2026/10/Aathi-Iva-Yarraa.jpg",
+    "poster_url": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRnj9XkbFhrGABEnU9hq4hk26ruwko85moabUEOcpRnSeg1i5aSfSN7yp4&s=10",
+    "cover_url": "https://i0.wp.com/indiaglitz.com/wp-content/uploads/2026/10/scene-first-single.jpg",
     "release_date": "2026-11-06",
     "ignore_soldout_chains": ["AMC"],
     "extra": []
