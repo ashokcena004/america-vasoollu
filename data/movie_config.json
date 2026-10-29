@@ -20,7 +20,7 @@
     "cover_url": "https://m.media-amazon.com/images/M/MV5BODRjNWFlMjUtYzFhNy00ZGNmLTgxYzktMGViMTMxN2RjODIwXkEyXkFqcGc@._V1_.jpg",
     "release_date": "2026-11-04",
     "ignore_soldout_chains": ["AMC"],
-    "extra": []
+    "extra": ["EXTRA", "", "", 10000.0, 0, 500]
   },
 
   "aadarsha-kutumbam-house-no-47": {
