@@ -999,11 +999,9 @@ def publish_analytics_payload(
             previous_detail_page_count = previous.get("detail_page_count")
         else:
             advance_summary = db.reference(
-                f"{root}/analytics_v2/runs/{previous_advance_run_id}/summary"
+                f"{root}/analytics_v2/runs/{previous_advance_run_id}/summary/metrics"
             ).get() or {}
-            previous_detail_count = (advance_summary.get("metrics") or {}).get(
-                "show_count", 0
-            )
+            previous_detail_count = advance_summary.get("show_count", 0)
     previous_detail_count = int(previous_detail_count or 0)
     previous_detail_page_count = int(
         previous_detail_page_count

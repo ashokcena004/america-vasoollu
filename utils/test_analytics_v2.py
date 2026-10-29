@@ -756,8 +756,8 @@ class AnalyticsV2Tests(unittest.TestCase):
             "detail_page_count": 2,
         })
         database.reference(
-            f"{root}/analytics_v2/runs/advance-old/summary"
-        ).set({"metrics": {"show_count": 1}})
+            f"{root}/analytics_v2/runs/advance-old/summary/metrics"
+        ).set({"show_count": 1})
         payload = build_analytics_payload(
             [make_show("8:00 PM", 10, 100)],
             market_id="usa",

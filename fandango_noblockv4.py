@@ -1268,11 +1268,11 @@ if __name__ == "__main__":
                 ) or 0),
             )
             previous_summary = db.reference(
-                f"{date_root}/analytics_v2/runs/{active_run_id}/summary"
+                f"{date_root}/analytics_v2/runs/{active_run_id}/summary/metrics"
             ).get() or {}
             append_unpublished_extra_metrics(
                 recent_shows_data,
-                previous_summary.get("metrics"),
+                previous_summary,
             )
             recent_shows_timestamp = published.get("observed_at")
             print(f"📈 Loaded {len(recent_shows_data)} shows from V2 run {active_run_id}.")
