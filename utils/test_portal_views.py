@@ -9,6 +9,7 @@ from build_portal_views import (
     _market_today,
     _apply_matching_advance_occupancy,
     _latest_observed_at,
+    _display_title,
     build_portal_views,
 )
 
@@ -19,7 +20,24 @@ class FakeReference:
         self.path = path
 
     def get(self):
-        return deepcopy(self.database.values.get(self.path))
+        self.database.reads.append(self.path)
+        value = self.database.values.get(self.path)
+        if value is not None:
+            return deepcopy(value)
+        parts = self.path.split("/")
+        for split in range(len(parts) - 1, 0, -1):
+            parent_path = "/".join(parts[:split])
+            if parent_path not in self.database.values:
+                continue
+            value = self.database.values[parent_path]
+            for part in parts[split:]:
+                if not isinstance(value, dict):
+                    return None
+                value = value.get(part)
+                if value is None:
+                    return None
+            return deepcopy(value)
+        return None
 
     def set(self, value):
         self.database.values[self.path] = deepcopy(value)
@@ -28,12 +46,19 @@ class FakeReference:
 class FakeDatabase:
     def __init__(self):
         self.values = {}
+        self.reads = []
 
     def reference(self, path):
         return FakeReference(self, path)
 
 
 class PortalLifecycleTests(unittest.TestCase):
+    def test_display_title_removes_trailing_release_year_without_removing_year_titles(self):
+        self.assertEqual(_display_title("Scene 2026"), "Scene")
+        self.assertEqual(_display_title("Scene (2026)"), "Scene")
+        self.assertEqual(_display_title("Scene [2026]"), "Scene")
+        self.assertEqual(_display_title("2012"), "2012")
+
     def test_trajectory_keeps_each_show_date_observation_timestamp(self):
         dates = {
             "2026-10-12": {"current": {"booked_gross": 100}},
@@ -211,6 +236,11 @@ class PortalLifecycleTests(unittest.TestCase):
         self.assertEqual(movie["total_gross_so_far"], 1000)
         self.assertEqual(movie["current"]["total_gross"], 1000)
         self.assertEqual(movie["current"]["total_tickets"], 10)
+        summary_reads = [
+            path for path in database.reads if "/analytics_v2/runs/" in path
+        ]
+        self.assertTrue(any(path.endswith("/metrics") for path in summary_reads))
+        self.assertFalse(any(path.endswith("/summary") for path in summary_reads))
         self.assertEqual(movie["current"]["total_shows"], 2)
         self.assertAlmostEqual(movie["current"]["avg_occupancy"], 0.4)
         self.assertTrue(movie["current"]["avg_occupancy_is_estimate"])

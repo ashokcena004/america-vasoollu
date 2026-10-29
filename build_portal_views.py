@@ -65,6 +65,13 @@ def _title_from_id(movie_id: str) -> str:
     return re.sub(r"[-_]+", " ", movie_id).strip().title()
 
 
+def _display_title(value: Any) -> str:
+    title = str(value or "").strip()
+    title = re.sub(r"\s*(?:\((?:19|20)\d{2}\)|\[(?:19|20)\d{2}\])\s*$", "", title)
+    title = re.sub(r"\s+(?:19|20)\d{2}\s*$", "", title)
+    return title.strip()
+
+
 def _date_value(value: str) -> date | None:
     try:
         return date.fromisoformat(value)
@@ -81,11 +88,57 @@ def _occupancy(metrics: dict) -> float:
     return occupancy_rate / 100 if occupancy_rate > 1 else occupancy_rate
 
 
-def _summary_reference(db: Any, market_id: str, movie_id: str, show_date: str, run_id: str):
-    return db.reference(
+def _summary_reference(
+    db: Any,
+    market_id: str,
+    movie_id: str,
+    show_date: str,
+    run_id: str,
+    field: str | None = None,
+):
+    path = (
         f"markets/{market_id}/movies/{movie_id}/dates/{show_date}/"
         f"analytics_v2/runs/{run_id}/summary"
     )
+    return db.reference(f"{path}/{field}" if field else path)
+
+
+def _read_summary_projection(
+    db: Any,
+    market_id: str,
+    movie_id: str,
+    show_date: str,
+    run_id: str,
+    published: dict,
+) -> dict:
+    metrics = _as_dict(
+        _summary_reference(
+            db, market_id, movie_id, show_date, run_id, "metrics"
+        ).get()
+    )
+    if not metrics:
+        return {}
+
+    observed_at = published.get("observed_at")
+    if run_id != published.get("active_run_id") or not observed_at:
+        observed_at = _summary_reference(
+            db, market_id, movie_id, show_date, run_id, "observed_at"
+        ).get()
+    summary = {"metrics": metrics, "observed_at": observed_at}
+    if market_id.lower() == "usa":
+        previous_run_metrics = _as_dict(
+            _summary_reference(
+                db,
+                market_id,
+                movie_id,
+                show_date,
+                run_id,
+                "growth/previous_run/metrics",
+            ).get()
+        )
+        if previous_run_metrics:
+            summary["growth"] = {"previous_run": {"metrics": previous_run_metrics}}
+    return summary
 
 
 def _choose_basis(
@@ -163,8 +216,13 @@ def _read_date_summaries(
                 "advance_run_id" if use_advance_for_current else "active_run_id"
             )
             if run_id:
-                summary = _as_dict(
-                    _summary_reference(db, market_id, movie_id, show_date, str(run_id)).get()
+                summary = _read_summary_projection(
+                    db,
+                    market_id,
+                    movie_id,
+                    show_date,
+                    str(run_id),
+                    published,
                 )
                 if summary:
                     current_summaries[show_date] = summary
@@ -194,8 +252,13 @@ def _read_date_summaries(
         ):
             run_id = published.get("advance_run_id")
             if run_id:
-                summary = _as_dict(
-                    _summary_reference(db, market_id, movie_id, show_date, str(run_id)).get()
+                summary = _read_summary_projection(
+                    db,
+                    market_id,
+                    movie_id,
+                    show_date,
+                    str(run_id),
+                    published,
                 )
                 if summary:
                     advance_summaries[show_date] = summary
@@ -575,7 +638,7 @@ def _movie_documents(
     }
     last_observed_at = _latest_observed_at(current_summaries, advance_summaries)
 
-    title = str(
+    title = _display_title(
         metadata.get("title")
         or metadata.get("name")
         or movie_index.get("title")
