@@ -50,7 +50,7 @@ THEATER_BATCH_SIZE = 5              # Theaters processed per IPC call (fetched s
 SEATMAP_CONCURRENCY_PER_WORKER = 1  # Serialize seatMap requests within each worker
 THEATER_REQUEST_DELAY_MS = 150      # Stagger sequential theater requests within each batch
 SEATMAP_REQUEST_DELAY_MS = 200      # Pace sequential seatMap requests within each worker
-THEATER_BATCH_COOLDOWN_SECONDS = 0.5
+THEATER_BATCH_COOLDOWN_SECONDS = 0.35
 SEATMAP_THEATER_COOLDOWN_SECONDS = 0.25
 PROACTIVE_ROTATE_LIMIT = 300        # Clear cookies & mint fresh Akamai token every 300 requests
 MAX_API_RETRIES = 4                 # Automatic cookie-reset retries on 403/429/timeout
@@ -773,6 +773,13 @@ class LiveTerminalDashboard:
     """
     def __init__(self, total_theaters: int):
         self.total_theaters = total_theaters
+        self.github_actions = os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+        self.progress_log_interval = 10.0
+        self.last_progress_log = 0.0
+        self.phase_started_at = 0.0
+        self.current_phase = 1
+        self.latest_theater = ""
+        self.last_progress_message = ""
         self.scanned_theaters = 0
         self.active_theaters_found = 0
         self.discovered_shows_count = 0
@@ -791,16 +798,63 @@ class LiveTerminalDashboard:
         self.pbar_kpi = None
         self.pbar_latest = None
 
+    def _emit_ci_progress(self, force: bool = False):
+        now = time.monotonic()
+        if not force and now - self.last_progress_log < self.progress_log_interval:
+            return
+        self.last_progress_log = now
+
+        if self.current_phase == 1:
+            percent = (
+                self.scanned_theaters / self.total_theaters * 100.0
+                if self.total_theaters
+                else 100.0
+            )
+            line = (
+                f"Phase 1 progress: {self.scanned_theaters}/{self.total_theaters} "
+                f"({percent:.1f}%) | Active theaters: {self.active_theaters_found} "
+                f"| Shows found: {self.discovered_shows_count:,} "
+                f"| Retries: {self.phase1_retries}"
+            )
+        else:
+            occupancy = (
+                self.total_booked / self.total_capacity * 100.0
+                if self.total_capacity
+                else 0.0
+            )
+            line = (
+                f"Phase 2 progress: {self.processed_theaters}/{self.active_theaters_found} "
+                f"theaters | {self.processed_shows:,} shows "
+                f"(sold out: {self.sold_out_shows}) | Booked: "
+                f"{self.total_booked:,}/{self.total_capacity:,} ({occupancy:.2f}%) "
+                f"| Gross: ${self.total_gross:,.2f} | Healed: {self.healed_count} "
+                f"| Retries: {self.phase2_retries}"
+            )
+            if self.latest_theater:
+                line += f" | Latest: {self.latest_theater}"
+        if line != self.last_progress_message:
+            print(line, flush=True)
+            self.last_progress_message = line
+
     def start_phase1(self):
-        self.pbar_main = tqdm(
-            total=self.total_theaters,
-            desc="🔍 Phase 1: Theater Discovery",
-            unit="th",
-            position=0,
-            leave=True,
-            dynamic_ncols=True,
-            bar_format="{l_bar}{bar:28}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
-        )
+        self.current_phase = 1
+        self.phase_started_at = time.monotonic()
+        self.last_progress_log = 0.0
+        if self.github_actions:
+            print(
+                f"Phase 1 started: scanning {self.total_theaters:,} theaters.",
+                flush=True,
+            )
+        else:
+            self.pbar_main = tqdm(
+                total=self.total_theaters,
+                desc="🔍 Phase 1: Theater Discovery",
+                unit="th",
+                position=0,
+                leave=True,
+                dynamic_ncols=True,
+                bar_format="{l_bar}{bar:28}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+            )
 
     def update_phase1(self, scanned_delta: int, active_delta: int, shows_delta: int, retries_delta: int = 0):
         self.scanned_theaters += scanned_delta
@@ -812,36 +866,50 @@ class LiveTerminalDashboard:
             self.pbar_main.set_postfix_str(
                 f"ActiveTheaters={self.active_theaters_found} | ShowsFound={self.discovered_shows_count:,} | Retries={self.phase1_retries}"
             )
+        elif self.github_actions:
+            self._emit_ci_progress()
 
     def finish_phase1(self):
         if self.pbar_main:
             self.pbar_main.close()
+        elif self.github_actions:
+            self._emit_ci_progress(force=True)
 
     def start_phase2(self, total_shows_to_scrape: int, total_active_theaters: int):
+        self.current_phase = 2
         self.active_theaters_found = total_active_theaters
-        self.pbar_main = tqdm(
-            total=max(1, total_shows_to_scrape),
-            desc="🎟️ Phase 2: Scraping SeatMaps",
-            unit="show",
-            position=0,
-            leave=True,
-            dynamic_ncols=True,
-            bar_format="{l_bar}{bar:28}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-        )
-        self.pbar_kpi = tqdm(
-            total=1,
-            position=1,
-            leave=True,
-            dynamic_ncols=True,
-            bar_format="{desc}",
-        )
-        self.pbar_latest = tqdm(
-            total=1,
-            position=2,
-            leave=True,
-            dynamic_ncols=True,
-            bar_format="{desc}",
-        )
+        self.phase_started_at = time.monotonic()
+        self.last_progress_log = 0.0
+        if self.github_actions:
+            print(
+                f"Phase 2 started: scraping {total_shows_to_scrape:,} shows "
+                f"across {total_active_theaters:,} theaters.",
+                flush=True,
+            )
+        else:
+            self.pbar_main = tqdm(
+                total=max(1, total_shows_to_scrape),
+                desc="🎟️ Phase 2: Scraping SeatMaps",
+                unit="show",
+                position=0,
+                leave=True,
+                dynamic_ncols=True,
+                bar_format="{l_bar}{bar:28}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+            )
+            self.pbar_kpi = tqdm(
+                total=1,
+                position=1,
+                leave=True,
+                dynamic_ncols=True,
+                bar_format="{desc}",
+            )
+            self.pbar_latest = tqdm(
+                total=1,
+                position=2,
+                leave=True,
+                dynamic_ncols=True,
+                bar_format="{desc}",
+            )
         self._refresh_kpi_lines("Waiting for first theater...")
 
     def _refresh_kpi_lines(self, latest_theater_str: str = ""):
@@ -857,6 +925,9 @@ class LiveTerminalDashboard:
             )
         if self.pbar_latest and latest_theater_str:
             self.pbar_latest.set_description_str(f"🎬 Latest: {latest_theater_str}")
+        elif self.github_actions and latest_theater_str != "Waiting for first theater...":
+            self.latest_theater = latest_theater_str
+            self._emit_ci_progress()
 
     def update_phase2_theater(
         self,
@@ -893,6 +964,8 @@ class LiveTerminalDashboard:
         for pb in (self.pbar_latest, self.pbar_kpi, self.pbar_main):
             if pb:
                 pb.close()
+        if self.github_actions:
+            self._emit_ci_progress(force=True)
 
 
 async def refresh_akamai_trust(context, page, worker_id, detailed_logger, reset_cookies=False):
@@ -3168,6 +3241,7 @@ if __name__ == "__main__":
     # =========================================================================
     if master_shows_data:
         print(f"\n🚀 Formatting data and building reports...")
+        os.makedirs("reports", exist_ok=True)
         current_time = time.strftime("%Y%m%d_%H%M%S")
         base_name = f"reports/Fandango_USA_{SHOW_DATE}_{current_time}"
 
