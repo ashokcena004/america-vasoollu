@@ -12,7 +12,7 @@
   },
 
   "ramayana": {
-    "movie_url": "https://www.fandango.com/ramayana-2026-245446/movie-overview",
+    "movie_url": ["https://www.fandango.com/ramayana-2026-245446/movie-overview", "https://www.fandango.com/ramayana-rise-of-a-legend-english-2026-248284/movie-overview"],
     "average_price": 30.0,
     "max_price": 30.0,
     "default_language": "Hindi",
