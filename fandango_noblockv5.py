@@ -9,6 +9,7 @@ import traceback
 from dotenv import load_dotenv
 import pytz
 from playwright.async_api import async_playwright
+from tqdm import tqdm
 
 load_dotenv()
 
@@ -43,18 +44,165 @@ OVERRIDE_FIREBASE_DAILY_SNAPSHOT = False  # ⚠️ Set to True to update the Fir
 # If a show at these chains is "Sold Out", its tickets and gross will be zeroed out.
 IGNORE_SOLDOUT_CHAINS = ["AMC"]
 
-# 🚀 HIGH-SPEED ENGINE TUNING PARAMETERS
-MAX_WORKERS = 8                     # Independent Chromium processes (separate TLS/HTTP2 sockets)
-THEATER_BATCH_SIZE = 3              # Theaters checked per JS batch call
-SEATMAP_CONCURRENCY_PER_WORKER = 2  # Parallel seatMap fetches inside each worker's browser
-PROACTIVE_ROTATE_LIMIT = 320        # Refresh Akamai cookie before the ~440 request cliff
-MAX_API_RETRIES = 3                 # Automatic retries on 403/429/timeout per request
+# 🚀 HIGH-SPEED ENGINE TUNING PARAMETERS (SAFE AKAMAI PROFILE)
+MAX_WORKERS = 8                     # 8 independent Chromium processes (safe single-IP footprint)
+THEATER_BATCH_SIZE = 5              # Theaters processed per IPC call (fetched sequentially inside JS)
+SEATMAP_CONCURRENCY_PER_WORKER = 2  # Max parallel seatMap requests per worker
+PROACTIVE_ROTATE_LIMIT = 300        # Clear cookies & mint fresh Akamai token every 300 requests
+MAX_API_RETRIES = 4                 # Automatic cookie-reset retries on 403/429/timeout
 
 # =============================================================================
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MOVIE_CONFIG_PATH = os.path.join(SCRIPT_DIR, "data", "movie_config.json")
 FANDANGO_QUEUE_PATH = os.path.join(SCRIPT_DIR, "data", "fandango_scrape_queue.json")
+
+
+def parse_movie_targets(raw_movie_url_field):
+    """
+    Accepts a single string or a list of strings from movie_config.json ('movie_url' or 'movie_urls').
+    Each item can be:
+      - Full URL: "https://www.fandango.com/scene-2026-248114/movie-overview"
+      - Slug + ID: "scene-2026-248114"
+      - Numeric ID: "248114"
+    Returns: (primary_url, primary_slug, primary_id, ordered_unique_ids_list)
+    """
+    raw_items = []
+    for entry in (
+        raw_movie_url_field
+        if isinstance(raw_movie_url_field, list)
+        else [raw_movie_url_field]
+    ):
+        raw_items.extend(
+            part.strip()
+            for part in str(entry or "").split(",")
+            if part.strip()
+        )
+
+    parsed_entries = []
+    for s in raw_items:
+        # 1. Full URL match
+        url_m = re.search(
+            r"fandango\.com/([a-zA-Z0-9-]+?)-(\d+)(?:/|$|\?)", s, re.IGNORECASE
+        )
+        if url_m:
+            slug_part, id_part = url_m.group(1), url_m.group(2)
+            full_u = (
+                s
+                if s.startswith("http")
+                else f"https://www.fandango.com/{slug_part}-{id_part}/movie-overview"
+            )
+            parsed_entries.append((full_u, slug_part, id_part))
+            continue
+
+        # 2. Slug + ID match (e.g. "scene-2026-248114")
+        slug_m = re.search(r"^([a-zA-Z0-9-]+?)-(\d+)$", s)
+        if slug_m:
+            slug_part, id_part = slug_m.group(1), slug_m.group(2)
+            full_u = f"https://www.fandango.com/{slug_part}-{id_part}/movie-overview"
+            parsed_entries.append((full_u, slug_part, id_part))
+            continue
+
+        # 3. Raw Numeric ID match (e.g. "248114")
+        if s.isdigit():
+            parsed_entries.append(("", "", s))
+            continue
+
+    if not parsed_entries:
+        raise ValueError(
+            f"Could not extract any valid Fandango Movie ID from movie_url: {raw_movie_url_field!r}"
+        )
+
+    primary_entry = next(
+        (entry for entry in parsed_entries if entry[1]),
+        parsed_entries[0],
+    )
+    primary_url, primary_slug, primary_id = primary_entry
+    if not primary_slug:
+        primary_slug = f"movie-{primary_id}"
+    if not primary_url:
+        primary_url = (
+            f"https://www.fandango.com/{primary_slug}-{primary_id}/movie-overview"
+        )
+
+    all_ids = []
+    for _, _, mid in parsed_entries:
+        if mid and mid not in all_ids:
+            all_ids.append(mid)
+
+    return primary_url, primary_slug, primary_id, all_ids
+
+
+def load_movie_config(config_path, global_slug):
+    try:
+        with open(config_path, "r", encoding="utf-8") as config_file:
+            movie_configs = json.load(config_file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Could not load movie configuration at {config_path}."
+        ) from exc
+
+    if not isinstance(movie_configs, dict):
+        raise ValueError(f"Movie configuration must be a JSON object: {config_path}")
+    movie_config = movie_configs.get(global_slug)
+    if not isinstance(movie_config, dict):
+        raise KeyError(
+            f"No movie configuration found for global slug {global_slug!r} "
+            f"in {config_path}."
+        )
+
+    raw_url_field = next(
+        (
+            movie_config.get(field)
+            for field in ("movie_url", "movie_urls", "movie_ids", "additional_movie_ids")
+            if movie_config.get(field)
+        ),
+        None,
+    )
+    if not raw_url_field or (
+        isinstance(raw_url_field, str) and not raw_url_field.strip()
+    ):
+        raise ValueError(
+            f"Movie configuration for {global_slug!r} must provide a non-empty 'movie_url' (string or list)."
+        )
+
+    if (
+        not isinstance(movie_config.get("default_language"), str)
+        or not movie_config["default_language"].strip()
+    ):
+        raise ValueError(
+            f"Movie configuration for {global_slug!r} must provide a non-empty 'default_language'."
+        )
+
+    for field in ("average_price", "max_price"):
+        value = movie_config.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ValueError(
+                f"Movie configuration field {field!r} for {global_slug!r} "
+                "must be a non-negative number."
+            )
+    for field in ("poster_url", "cover_url", "release_date"):
+        if field in movie_config and not isinstance(movie_config[field], str):
+            raise ValueError(
+                f"Movie configuration field {field!r} for {global_slug!r} "
+                "must be a string."
+            )
+    extra = movie_config.get("extra", [])
+    if not isinstance(extra, list):
+        raise ValueError(
+            f"Movie configuration field 'extra' for {global_slug!r} must be a list."
+        )
+    if extra and (
+        len(extra) != 6
+        or not isinstance(extra[0], str)
+        or extra[0].upper() != "EXTRA"
+    ):
+        raise ValueError(
+            f"Movie configuration field 'extra' for {global_slug!r} must be "
+            'empty or shaped like ["EXTRA", "", "", gross, 0, tickets].'
+        )
+
+    return movie_config
 
 
 def load_fandango_scrape_queue(queue_path):
@@ -135,158 +283,6 @@ print(
 )
 
 
-def parse_movie_targets(raw_movie_url_field, extra_ids_field=None):
-    """
-    Accepts a single string, comma-separated string, or a list of strings/ints from
-    movie_config.json ('movie_url', 'movie_urls', 'movie_ids', 'additional_movie_ids').
-    Each item can be:
-      - Full URL: "https://www.fandango.com/scene-2026-248114/movie-overview"
-      - Slug + ID: "scene-2026-248114"
-      - Numeric ID: "248114" or 248114
-    Returns: (primary_url, primary_slug, primary_id, ordered_unique_ids_list)
-    """
-    combined_inputs = []
-    for source in (raw_movie_url_field, extra_ids_field):
-        if source is None:
-            continue
-        if isinstance(source, list):
-            combined_inputs.extend(source)
-        else:
-            combined_inputs.append(source)
-
-    raw_items = []
-    for entry in combined_inputs:
-        for part in str(entry or "").split(","):
-            if part.strip():
-                raw_items.append(part.strip())
-
-    parsed_entries = []
-    for s in raw_items:
-        # 1. Full URL match
-        url_m = re.search(
-            r"fandango\.com/([a-zA-Z0-9-]+?)-(\d+)(?:/|$|\?)", s, re.IGNORECASE
-        )
-        if url_m:
-            slug_part, id_part = url_m.group(1), url_m.group(2)
-            full_u = (
-                s
-                if s.startswith("http")
-                else f"https://www.fandango.com/{slug_part}-{id_part}/movie-overview"
-            )
-            parsed_entries.append((full_u, slug_part, id_part))
-            continue
-
-        # 2. Slug + ID match (e.g. "scene-2026-248114")
-        slug_m = re.search(r"^([a-zA-Z0-9-]+?)-(\d+)$", s)
-        if slug_m:
-            slug_part, id_part = slug_m.group(1), slug_m.group(2)
-            full_u = f"https://www.fandango.com/{slug_part}-{id_part}/movie-overview"
-            parsed_entries.append((full_u, slug_part, id_part))
-            continue
-
-        # 3. Raw Numeric ID match (e.g. "248114")
-        if s.isdigit():
-            parsed_entries.append(("", "", s))
-            continue
-
-    if not parsed_entries:
-        raise ValueError(
-            f"Could not extract any valid Fandango Movie ID from movie_url: {raw_movie_url_field!r}"
-        )
-
-    primary_url, primary_slug, primary_id = parsed_entries[0]
-    if not primary_slug:
-        for u, sl, _ in parsed_entries:
-            if sl:
-                primary_slug = sl
-                if not primary_url:
-                    primary_url = u
-                break
-    if not primary_slug:
-        primary_slug = f"movie-{primary_id}"
-    if not primary_url:
-        primary_url = (
-            f"https://www.fandango.com/{primary_slug}-{primary_id}/movie-overview"
-        )
-
-    all_ids = []
-    for _, _, mid in parsed_entries:
-        if mid and mid not in all_ids:
-            all_ids.append(mid)
-
-    return primary_url, primary_slug, primary_id, all_ids
-
-
-def load_movie_config(config_path, global_slug):
-    try:
-        with open(config_path, "r", encoding="utf-8") as config_file:
-            movie_configs = json.load(config_file)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(
-            f"Could not load movie configuration at {config_path}."
-        ) from exc
-
-    if not isinstance(movie_configs, dict):
-        raise ValueError(f"Movie configuration must be a JSON object: {config_path}")
-    movie_config = movie_configs.get(global_slug)
-    if not isinstance(movie_config, dict):
-        raise KeyError(
-            f"No movie configuration found for global slug {global_slug!r} "
-            f"in {config_path}."
-        )
-
-    raw_url_field = (
-        movie_config.get("movie_url")
-        or movie_config.get("movie_urls")
-        or movie_config.get("movie_ids")
-        or movie_config.get("additional_movie_ids")
-    )
-    if not raw_url_field or (
-        isinstance(raw_url_field, str) and not raw_url_field.strip()
-    ):
-        raise ValueError(
-            f"Movie configuration for {global_slug!r} must provide "
-            "a non-empty 'movie_url' (string or list)."
-        )
-    if (
-        not isinstance(movie_config.get("default_language"), str)
-        or not movie_config["default_language"].strip()
-    ):
-        raise ValueError(
-            f"Movie configuration for {global_slug!r} must provide "
-            "a non-empty 'default_language'."
-        )
-    for field in ("average_price", "max_price"):
-        value = movie_config.get(field)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
-            raise ValueError(
-                f"Movie configuration field {field!r} for {global_slug!r} "
-                "must be a non-negative number."
-            )
-    for field in ("poster_url", "cover_url", "release_date"):
-        if field in movie_config and not isinstance(movie_config[field], str):
-            raise ValueError(
-                f"Movie configuration field {field!r} for {global_slug!r} "
-                "must be a string."
-            )
-    extra = movie_config.get("extra", [])
-    if not isinstance(extra, list):
-        raise ValueError(
-            f"Movie configuration field 'extra' for {global_slug!r} must be a list."
-        )
-    if extra and (
-        len(extra) != 6
-        or not isinstance(extra[0], str)
-        or extra[0].upper() != "EXTRA"
-    ):
-        raise ValueError(
-            f"Movie configuration field 'extra' for {global_slug!r} must be "
-            'empty or shaped like ["EXTRA", "", "", gross, 0, tickets].'
-        )
-
-    return movie_config
-
-
 FALLBACK_SEATS = 100
 PRICE_TAX_CUT = False  # If True, rounds ticket prices down to nearest multiple of 5 (e.g., $29 -> $25)
 OCC_THRESHOLD_FRONTROW = 0.50  # If overall occupancy is below this, treat front row 'R' seats as blocks
@@ -302,10 +298,7 @@ RAW_MOVIE_URL_CONFIG = [
     )
     if MOVIE_CONFIG.get(field) not in (None, "")
 ]
-
-URL, MOVIE_SLUG, MOVIE_ID, TARGET_MOVIE_IDS = parse_movie_targets(
-    RAW_MOVIE_URL_CONFIG
-)
+URL, MOVIE_SLUG, MOVIE_ID, TARGET_MOVIE_IDS = parse_movie_targets(RAW_MOVIE_URL_CONFIG)
 TARGET_MOVIE_IDS_SET = set(TARGET_MOVIE_IDS)
 
 AVG_PRICE = float(MOVIE_CONFIG["average_price"])
@@ -577,7 +570,6 @@ SEAT_COUNT_MODE = 1
 # 2 = Use cached summary data from API
 
 # 🎯 SCREEN EXCLUSION CONFIGURATION
-# Format: "TheaterID_AuditoriumID"
 PREFER_CACHED_SCREENS = [
     "9E1KKd3a_10",  # Cinemark Merriam and XD - Aud 10
     "9E1KKd3a_25",  # Cinemark Merriam and XD - Aud 25
@@ -588,7 +580,7 @@ PREFER_PHYSICAL_SCREENS = []
 MANUAL_MERGE_SHOWS_THEATRES = ["AAILI"]
 
 # =============================================================================
-# FIREBASE CONFIGURATION
+# FIREBASE CONFIGURATION & HELPERS
 # =============================================================================
 FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS", "")
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "")
@@ -597,7 +589,6 @@ FIREBASE_LOCAL_HASH_WINS = True
 
 
 def initialize_firebase():
-    """Initialize Firebase using service-account credentials from the environment."""
     if not USE_FIREBASE:
         print("🔥 Firebase disabled (USE_FIREBASE=False).")
         return False
@@ -632,12 +623,10 @@ def initialize_firebase():
 
 
 def firebase_movie_root():
-    """Return the V2 Firebase date node for this movie."""
     return f"{FIREBASE_ROOT_PATH}/{MOVIE_SLUG}/dates/{SHOW_DATE}"
 
 
 def load_firebase_hash_cache():
-    """Read the Firebase hash cache. Returns {} on any failure."""
     if not USE_FIREBASE:
         return {}
     try:
@@ -657,7 +646,6 @@ def load_firebase_hash_cache():
 
 
 def merge_hash_caches(local_cache, firebase_cache):
-    """Merge local + Firebase hash caches."""
     merged = {}
     conflicts = 0
 
@@ -686,7 +674,6 @@ def merge_hash_caches(local_cache, firebase_cache):
 
 
 def load_v2_show_pages(date_root, run_id, page_count):
-    """Read the published detail run used for reconciliation and cumulative mode."""
     rows = []
     for page_number in range(1, page_count + 1):
         page = db.reference(
@@ -705,7 +692,6 @@ def load_v2_show_pages(date_root, run_id, page_count):
 
 
 def append_unpublished_extra_metrics(rows, metrics):
-    """Restore manual EXTRA adjustments kept only in the published summary."""
     if not isinstance(metrics, dict):
         return
 
@@ -741,7 +727,6 @@ def append_unpublished_extra_metrics(rows, metrics):
 
 
 def save_local_hash_cache(master_hash_cache):
-    """Always save the complete merged cache locally."""
     try:
         with open(HASH_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(master_hash_cache, f, indent=4)
@@ -772,72 +757,193 @@ TARGET_STATES = [
 
 
 # =============================================================================
-# ── 2. HIGH-SPEED ASYNC MULTI-BROWSER WORKER ENGINE ─────────────────────────
+# ── 2. PINNED LIVE TERMINAL DASHBOARD & TWO-PHASE LOAD-BALANCED ENGINE ──────
 # =============================================================================
 
-def record_rate_limit(detailed_logger, rate_limit_events, status, endpoint, worker_id):
-    event = (
-        f"[Worker-{worker_id}] Fandango API returned HTTP {status} "
-        f"for {endpoint}"
-    )
-    rate_limit_events.append(event)
-    detailed_logger.warning(event)
-    for handler in detailed_logger.handlers:
-        handler.flush()
-    print(f"RATE LIMIT: {event}", flush=True)
+class LiveTerminalDashboard:
+    """
+    Renders a non-scrolling, in-place updating 3-line terminal dashboard:
+      - Line 1: Progress bar with percentage, elapsed time, ETA, and speed
+      - Line 2: Live cumulative Box Office KPIs (Theaters, Shows, SoldOut, Booked/Cap, Occ %, Gross $)
+      - Line 3: Latest completed theater summary
+    """
+    def __init__(self, total_theaters: int):
+        self.total_theaters = total_theaters
+        self.scanned_theaters = 0
+        self.active_theaters_found = 0
+        self.discovered_shows_count = 0
+        self.phase1_retries = 0
+
+        self.processed_theaters = 0
+        self.processed_shows = 0
+        self.sold_out_shows = 0
+        self.total_capacity = 0
+        self.total_booked = 0
+        self.total_gross = 0.0
+        self.healed_count = 0
+        self.phase2_retries = 0
+
+        self.pbar_main = None
+        self.pbar_kpi = None
+        self.pbar_latest = None
+
+    def start_phase1(self):
+        self.pbar_main = tqdm(
+            total=self.total_theaters,
+            desc="🔍 Phase 1: Theater Discovery",
+            unit="th",
+            position=0,
+            leave=True,
+            dynamic_ncols=True,
+            bar_format="{l_bar}{bar:28}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+        )
+
+    def update_phase1(self, scanned_delta: int, active_delta: int, shows_delta: int, retries_delta: int = 0):
+        self.scanned_theaters += scanned_delta
+        self.active_theaters_found += active_delta
+        self.discovered_shows_count += shows_delta
+        self.phase1_retries += retries_delta
+        if self.pbar_main:
+            self.pbar_main.update(scanned_delta)
+            self.pbar_main.set_postfix_str(
+                f"ActiveTheaters={self.active_theaters_found} | ShowsFound={self.discovered_shows_count:,} | Retries={self.phase1_retries}"
+            )
+
+    def finish_phase1(self):
+        if self.pbar_main:
+            self.pbar_main.close()
+
+    def start_phase2(self, total_shows_to_scrape: int, total_active_theaters: int):
+        self.active_theaters_found = total_active_theaters
+        self.pbar_main = tqdm(
+            total=max(1, total_shows_to_scrape),
+            desc="🎟️ Phase 2: Scraping SeatMaps",
+            unit="show",
+            position=0,
+            leave=True,
+            dynamic_ncols=True,
+            bar_format="{l_bar}{bar:28}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        )
+        self.pbar_kpi = tqdm(
+            total=1,
+            position=1,
+            leave=True,
+            dynamic_ncols=True,
+            bar_format="{desc}",
+        )
+        self.pbar_latest = tqdm(
+            total=1,
+            position=2,
+            leave=True,
+            dynamic_ncols=True,
+            bar_format="{desc}",
+        )
+        self._refresh_kpi_lines("Waiting for first theater...")
+
+    def _refresh_kpi_lines(self, latest_theater_str: str = ""):
+        occ = (self.total_booked / self.total_capacity * 100.0) if self.total_capacity > 0 else 0.0
+        atp = (self.total_gross / self.total_booked) if self.total_booked > 0 else 0.0
+        if self.pbar_kpi:
+            self.pbar_kpi.set_description_str(
+                f"📊 LIVE KPIs | Theaters: {self.processed_theaters}/{self.active_theaters_found} "
+                f"| Shows: {self.processed_shows:,} (SoldOut: {self.sold_out_shows}) "
+                f"| Booked: {self.total_booked:,}/{self.total_capacity:,} ({occ:.2f}%) "
+                f"| ATP: ${atp:.2f} | Gross: ${self.total_gross:,.2f} "
+                f"| Healed: {self.healed_count} | Retries: {self.phase2_retries}"
+            )
+        if self.pbar_latest and latest_theater_str:
+            self.pbar_latest.set_description_str(f"🎬 Latest: {latest_theater_str}")
+
+    def update_phase2_theater(
+        self,
+        state: str,
+        t_name: str,
+        shows_cnt: int,
+        sold_out_cnt: int,
+        cap_sum: int,
+        booked_sum: int,
+        gross_sum: float,
+        healed_cnt: int,
+        retries_cnt: int,
+    ):
+        self.processed_theaters += 1
+        self.processed_shows += shows_cnt
+        self.sold_out_shows += sold_out_cnt
+        self.total_capacity += cap_sum
+        self.total_booked += booked_sum
+        self.total_gross += gross_sum
+        self.healed_count += healed_cnt
+        self.phase2_retries += retries_cnt
+
+        if self.pbar_main:
+            self.pbar_main.update(shows_cnt)
+
+        t_occ = (booked_sum / cap_sum * 100.0) if cap_sum > 0 else 0.0
+        latest_str = (
+            f"[{state[:10]}] {t_name[:38]} -> {shows_cnt} Shows | "
+            f"{booked_sum:,}/{cap_sum:,} Booked ({t_occ:.1f}%) | ${gross_sum:,.2f}"
+        )
+        self._refresh_kpi_lines(latest_str)
+
+    def finish_phase2(self):
+        for pb in (self.pbar_latest, self.pbar_kpi, self.pbar_main):
+            if pb:
+                pb.close()
 
 
-def log_rate_limit_summary(detailed_logger, rate_limit_events):
-    summary = (
-        f"RATE LIMIT SUMMARY: observed {len(rate_limit_events)} HTTP 403/429 "
-        "responses during this run."
-    )
-    print(summary, flush=True)
-    detailed_logger.warning(summary)
-    for event in rate_limit_events:
-        detailed_logger.warning(event)
-    for handler in detailed_logger.handlers:
-        handler.flush()
-
-
-async def refresh_akamai_trust(page, worker_id, detailed_logger):
-    """Establishes or refreshes Akamai _abck sensor cookie on the worker's independent browser."""
+async def refresh_akamai_trust(context, page, worker_id, detailed_logger, reset_cookies=False):
+    """
+    Establishes or refreshes Akamai _abck sensor trust with full CSS/layout intact.
+    When reset_cookies=True (on 403/429 or proactive rotation), clears the cookie jar first
+    so any flagged _abck token is completely wiped before minting a new one.
+    """
     overview_url = f"https://www.fandango.com/{MOVIE_SLUG}-{MOVIE_ID}/movie-overview?date={SHOW_DATE}"
     try:
-        await page.goto(overview_url, wait_until="domcontentloaded", timeout=20000)
-        await page.wait_for_timeout(2600)
-        # Brief synthetic mouse & scroll telemetry so Akamai sensor validates the session
-        await page.mouse.move(220 + (worker_id * 15), 260 + (worker_id * 10), steps=4)
+        if reset_cookies:
+            await context.clear_cookies()
+        await page.goto(overview_url, wait_until="domcontentloaded", timeout=22000)
+        await page.wait_for_timeout(3000)
+        await page.mouse.move(180 + (worker_id * 15), 220 + (worker_id * 10), steps=4)
         await page.mouse.wheel(0, 200)
         await page.wait_for_timeout(400)
     except Exception as exc:
         detailed_logger.info(f"[Worker-{worker_id}] Trust warmup note: {exc}")
 
 
-async def fetch_theaters_batch_js(
-    page, batch_items, worker_id, detailed_logger, rate_limit_events
-):
+async def fetch_theaters_batch_js(context, page, batch_items, worker_id, detailed_logger):
     """
-    Fetches up to THEATER_BATCH_SIZE theater master lists in a single IPC call
-    with a 60ms stagger inside JS. Automatically retries any 403/429 after refreshing trust.
+    Fetches up to THEATER_BATCH_SIZE theaters SEQUENTIALLY inside Chrome V8 (1 request in flight
+    per worker = zero burst spikes) and filters viewModel.movies for TARGET_MOVIE_IDS inside JS
+    so 98% of non-matching theater JSON never crosses the Python IPC boundary.
     """
-    req_payload = [
-        {
-            "idx": idx,
-            "t_id": item[2].get("theaterId"),
-            "url": f"https://www.fandango.com/napi/theaterMovieShowtimes/{item[2].get('theaterId')}?chainCode=&startDate={SHOW_DATE}&isdesktop=false",
-        }
-        for idx, item in enumerate(batch_items)
-    ]
+    pending_indices = list(range(len(batch_items)))
+    collected_by_idx = {}
+    last_error_by_idx = {}
+    retries_used = 0
+    target_ids_list = list(TARGET_MOVIE_IDS_SET)
 
     for attempt in range(MAX_API_RETRIES):
+        if not pending_indices:
+            break
+
+        req_payload = [
+            {
+                "idx": idx,
+                "t_id": batch_items[idx][2].get("theaterId"),
+                "url": f"https://www.fandango.com/napi/theaterMovieShowtimes/{batch_items[idx][2].get('theaterId')}?chainCode=&startDate={SHOW_DATE}&isdesktop=false",
+            }
+            for idx in pending_indices
+        ]
+
         try:
             results = await asyncio.wait_for(
                 page.evaluate(
-                    """async (items) => {
+                    """async ({ items, targetIds }) => {
                         const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-                        return await Promise.all(items.map(async (item, i) => {
-                            if (i > 0) await sleep(i * 60);
+                        const out = [];
+                        for (let i = 0; i < items.length; i++) {
+                            const item = items[i];
+                            if (i > 0) await sleep(45);
                             const controller = new AbortController();
                             const timer = setTimeout(() => controller.abort(), 9000);
                             try {
@@ -846,72 +952,109 @@ async def fetch_theaters_batch_js(
                                     credentials: "same-origin"
                                 });
                                 clearTimeout(timer);
-                                if (!response.ok) return { idx: item.idx, error: response.status };
+                                if (!response.ok) {
+                                    out.push({ idx: item.idx, error: response.status });
+                                    if (response.status === 403 || response.status === 429) break;
+                                    continue;
+                                }
                                 const data = await response.json().catch(() => null);
-                                return { idx: item.idx, data: data };
+                                if (!data) {
+                                    out.push({ idx: item.idx, error: 500 });
+                                    continue;
+                                }
+                                const allMovies = (data.viewModel && data.viewModel.movies) ? data.viewModel.movies : [];
+                                const matchedMovies = allMovies.filter(m => targetIds.includes(String(m.id || "")));
+                                out.push({
+                                    idx: item.idx,
+                                    hasMovie: matchedMovies.length > 0,
+                                    movies: matchedMovies
+                                });
                             } catch (e) {
                                 clearTimeout(timer);
-                                return { idx: item.idx, error: "timeout" };
+                                out.push({ idx: item.idx, error: "timeout" });
                             }
-                        }));
+                        }
+                        return out;
                     }""",
-                    req_payload,
+                    {"items": req_payload, "targetIds": target_ids_list},
                 ),
-                timeout=14.0,
+                timeout=max(16.0, len(req_payload) * 4.5),
             )
-        except Exception:
-            results = [{"idx": i, "error": "eval_timeout"} for i in range(len(batch_items))]
+        except Exception as exc:
+            results = [
+                {"idx": idx, "error": f"eval_timeout: {exc}"}
+                for idx in pending_indices
+            ]
 
-        has_rate_limit = any(
-            isinstance(r, dict) and r.get("error") in (403, 429, "timeout", "eval_timeout")
-            for r in (results or [])
+        returned_indices = set()
+        attempt_rate_limit = next(
+            (
+                result.get("error")
+                for result in results or []
+                if isinstance(result, dict)
+                and result.get("error") in (403, 429)
+            ),
+            None,
         )
-        for result in results or []:
-            if not isinstance(result, dict) or result.get("error") not in (403, 429):
+        for r in results or []:
+            if not isinstance(r, dict):
                 continue
-            result_idx = result.get("idx")
-            request = next(
-                (item for item in req_payload if item["idx"] == result_idx),
-                None,
-            )
-            endpoint = (
-                request["url"]
-                if request
-                else f"theater batch item {result_idx}"
-            )
-            record_rate_limit(
-                detailed_logger,
-                rate_limit_events,
-                result["error"],
-                endpoint,
-                worker_id,
-            )
-        if not has_rate_limit:
-            return results
+            idx = r.get("idx")
+            returned_indices.add(idx)
+            err = r.get("error")
+            if err is not None:
+                last_error_by_idx[idx] = err
+            if err in (403, 429, "timeout") or (
+                isinstance(err, str) and "timeout" in err.lower()
+            ):
+                continue
+            else:
+                collected_by_idx[idx] = r
 
+        if attempt_rate_limit is not None:
+            for idx in pending_indices:
+                if idx not in returned_indices:
+                    last_error_by_idx[idx] = attempt_rate_limit
+
+        pending_indices = [idx for idx in pending_indices if idx not in collected_by_idx]
+        if not pending_indices:
+            break
+
+        retries_used += len(pending_indices)
         if attempt < MAX_API_RETRIES - 1:
             detailed_logger.info(
-                f"[Worker-{worker_id}] Theater batch hit 403/429/timeout (Attempt {attempt + 1}). Refreshing Akamai trust..."
+                f"[Worker-{worker_id}] Retrying {len(pending_indices)} failed theater "
+                f"request(s) (attempt {attempt + 2}/{MAX_API_RETRIES}) after refreshing Akamai trust..."
             )
-            await asyncio.sleep(1.5 + attempt)
-            await refresh_akamai_trust(page, worker_id, detailed_logger)
+            await asyncio.sleep(2.0 + (attempt * 1.5))
+            await refresh_akamai_trust(
+                context, page, worker_id, detailed_logger, reset_cookies=True
+            )
+        else:
+            for idx in pending_indices:
+                collected_by_idx[idx] = {
+                    "idx": idx,
+                    "error": last_error_by_idx.get(idx, "request_failed"),
+                }
 
-    return results
+    return [collected_by_idx[i] for i in range(len(batch_items))], retries_used
 
 
 async def fetch_seatmaps_for_theater_js(
-    page, hashes_to_fetch, worker_id, detailed_logger, rate_limit_events
+    context, page, hashes_to_fetch, worker_id, detailed_logger
 ):
     """
-    Fetches all seat maps for a single active theater inside one JS evaluation using
-    controlled concurrency (SEATMAP_CONCURRENCY_PER_WORKER = 2) and automatic retry on 403/429.
-    Returns dict: { tier_hash: response_data_or_error_dict }
+    Fetches all seat maps for an active theater using controlled JS concurrency
+    (SEATMAP_CONCURRENCY_PER_WORKER = 2) with a 65ms stagger. If a 403/429 occurs,
+    stops immediately, clears cookies, mints a fresh Akamai token, and retries.
     """
     if not hashes_to_fetch:
-        return {}
+        return {}, 0
 
     collected = {}
     pending = list(dict.fromkeys(hashes_to_fetch))
+    last_rate_limit_status = {}
+    retries_used = 0
 
     for attempt in range(MAX_API_RETRIES):
         if not pending:
@@ -926,12 +1069,16 @@ async def fetch_seatmaps_for_theater_js(
             batch_res = await asyncio.wait_for(
                 page.evaluate(
                     """async ({ items, concurrency }) => {
+                        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
                         const results = {};
                         let cursor = 0;
-                        const worker = async () => {
-                            while (cursor < items.length) {
+                        let rateLimited = false;
+                        const worker = async (wIdx) => {
+                            if (wIdx > 0) await sleep(wIdx * 80);
+                            while (cursor < items.length && !rateLimited) {
                                 const index = cursor++;
                                 const item = items[index];
+                                if (index >= concurrency) await sleep(65);
                                 const controller = new AbortController();
                                 const timer = setTimeout(() => controller.abort(), 9000);
                                 try {
@@ -946,6 +1093,9 @@ async def fetch_seatmaps_for_theater_js(
                                             results[item.hash] = data;
                                         } else {
                                             results[item.hash] = { error: response.status };
+                                            if (response.status === 403 || response.status === 429) {
+                                                rateLimited = true;
+                                            }
                                         }
                                     } else if (data) {
                                         results[item.hash] = data;
@@ -960,34 +1110,45 @@ async def fetch_seatmaps_for_theater_js(
                         };
                         const workers = [];
                         for (let w = 0; w < Math.min(concurrency, items.length); w++) {
-                            workers.push(worker());
+                            workers.push(worker(w));
                         }
                         await Promise.all(workers);
                         return results;
                     }""",
                     {"items": req_items, "concurrency": SEATMAP_CONCURRENCY_PER_WORKER},
                 ),
-                timeout=max(16.0, len(pending) * 4.5),
+                timeout=max(16.0, len(pending) * 4.2),
             )
         except Exception as exc:
             batch_res = {h: {"error": f"Eval Timeout: {exc}"} for h in pending}
 
         retry_next = []
+        attempt_rate_limit = next(
+            (
+                result.get("error")
+                for result in (batch_res or {}).values()
+                if isinstance(result, dict)
+                and result.get("error") in (403, 429)
+            ),
+            None,
+        )
         for h in pending:
-            res = (batch_res or {}).get(h, {"error": "missing"})
-            if isinstance(res, dict) and res.get("error") in (403, 429):
-                record_rate_limit(
-                    detailed_logger,
-                    rate_limit_events,
-                    res["error"],
-                    f"https://www.fandango.com/napi/seatMap/{h}",
-                    worker_id,
-                )
-            if isinstance(res, dict) and res.get("error") in (403, 429) or (
+            if h not in (batch_res or {}):
+                if attempt_rate_limit is not None:
+                    last_rate_limit_status[h] = attempt_rate_limit
+                retry_next.append(h)
+                continue
+            res = batch_res[h]
+            if (isinstance(res, dict) and res.get("error") in (403, 429)) or (
                 isinstance(res, dict)
                 and isinstance(res.get("error"), str)
                 and ("Exception" in res["error"] or "Timeout" in res["error"])
             ):
+                if (
+                    isinstance(res, dict)
+                    and res.get("error") in (403, 429)
+                ):
+                    last_rate_limit_status[h] = res["error"]
                 retry_next.append(h)
             else:
                 collected[h] = res
@@ -995,966 +1156,848 @@ async def fetch_seatmaps_for_theater_js(
         if not retry_next:
             break
 
+        retries_used += len(retry_next)
         pending = retry_next
         if attempt < MAX_API_RETRIES - 1:
             detailed_logger.info(
-                f"[Worker-{worker_id}] Retrying {len(pending)} rate-limited seatMap(s) after Akamai refresh..."
+                f"[Worker-{worker_id}] Retrying {len(pending)} failed seatMap(s) "
+                f"(attempt {attempt + 2}/{MAX_API_RETRIES}) after refreshing Akamai trust..."
             )
-            await asyncio.sleep(1.8 + attempt)
-            await refresh_akamai_trust(page, worker_id, detailed_logger)
+            await asyncio.sleep(2.0 + (attempt * 1.5))
+            await refresh_akamai_trust(
+                context, page, worker_id, detailed_logger, reset_cookies=True
+            )
         else:
             for h in pending:
-                collected[h] = (batch_res or {}).get(h, {"error": 403})
+                collected[h] = (batch_res or {}).get(
+                    h,
+                    {"error": last_rate_limit_status.get(h, "request_failed")},
+                )
 
-    return collected
+    return collected, retries_used
 
 
-async def process_theaters_worker_async(
-    async_queue,
-    worker_id,
-    total_tasks,
-    detailed_logger,
-    master_hash_cache,
-    rate_limit_events,
+def extract_grouped_shows_from_matched_movies(
+    matching_movies, t_id, t_name, target_state
 ):
-    if master_hash_cache is None:
-        master_hash_cache = {}
+    """Builds grouped_shows from the pre-filtered matching_movies list."""
+    if not matching_movies:
+        return None
 
-    local_shows_data = []
-    local_summary_data = {}
-    local_knowledge_base = {}
-    local_sold_out_queue = []
-    local_ignored_shows_log = []
-    local_hash_cache = {}
-    local_hash_healed_log = []
-
+    grouped_shows = {}
     multi_id_mode = len(TARGET_MOVIE_IDS_SET) > 1
 
-    async with async_playwright() as p:
-        # Separate Chromium OS process per worker -> Separate TLS/HTTP2 socket to Akamai!
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-            ],
-        )
-        context = await browser.new_context(viewport={"width": 1280, "height": 800})
-        page = await context.new_page()
+    for target_movie in matching_movies:
+        m_id = str(target_movie.get("id", "")).strip()
+        m_title = str(target_movie.get("title", "")).strip()
 
-        print(f"[Thread-{worker_id}] ⏳ Establishing Akamai Trust...")
-        detailed_logger.info(f"[Thread-{worker_id}] Establishing Akamai Trust...")
-        await refresh_akamai_trust(page, worker_id, detailed_logger)
+        for variant in target_movie.get("variants", []) or []:
+            raw_header = variant.get("filmFormatHeader", "") or "Standard"
+            base_format = raw_header.replace(" Format", "").strip() or "Standard"
 
-        reqs_since_refresh = 0
-        worker_rotate_limit = PROACTIVE_ROTATE_LIMIT + (worker_id * 20)
+            for amenity in variant.get("amenityGroups", []) or []:
+                raw_amenities = [
+                    am.get("name", "").strip()
+                    for am in amenity.get("amenities", [])
+                    if am.get("name")
+                ]
+                raw_amenities_upper = [a.upper() for a in raw_amenities]
+                is_dbox = any(
+                    "D-BOX" in a or "DBOX" in a for a in raw_amenities_upper
+                )
 
-        while not async_queue.empty():
-            # Proactively refresh Akamai sensor cookie before hitting ~440 request limit
-            if reqs_since_refresh >= worker_rotate_limit:
-                await refresh_akamai_trust(page, worker_id, detailed_logger)
-                reqs_since_refresh = 0
+                show_format = base_format
+                premium_keywords = [
+                    "XD", "IMAX", "LASER AT AMC", "4DX", "RPX", "D-BOX",
+                ]
+                for am_name, am_up in zip(raw_amenities, raw_amenities_upper):
+                    if (
+                        any(k in am_up for k in premium_keywords)
+                        and show_format == base_format
+                    ):
+                        show_format = am_name
+                        break
 
-            batch_items = []
-            for _ in range(THEATER_BATCH_SIZE):
-                try:
-                    item = async_queue.get_nowait()
-                    if item[2].get("theaterId"):
-                        batch_items.append(item)
-                except asyncio.QueueEmpty:
-                    break
+                report_format_categories = classify_report_formats(
+                    " ".join([base_format, *raw_amenities]),
+                    base_format,
+                )
+                if is_dbox and report_format_categories == ["Standard"]:
+                    report_format_categories = []
 
-            if not batch_items:
-                break
+                show_language = detect_show_language(
+                    raw_amenities, DEFAULT_LANGUAGE, movie_title=m_title
+                )
 
-            first_idx, first_state, first_t = batch_items[0]
-            print(
-                f"[Thread-{worker_id}] 🔍 [{first_idx}/{total_tasks}] "
-                f"{first_state[:4].upper()} | {first_t.get('theaterName', 'Unknown')[:35]} "
-                f"(+{len(batch_items) - 1} more)"
-                if len(batch_items) > 1
-                else f"[Thread-{worker_id}] 🔍 [{first_idx}/{total_tasks}] "
-                f"{first_state[:4].upper()} | {first_t.get('theaterName', 'Unknown')[:40]}"
-            )
+                signature_amenities = [
+                    a
+                    for a in raw_amenities_upper
+                    if "D-BOX" not in a
+                    and "DBOX" not in a
+                    and "RESERVED" not in a
+                    and "RECLINERS" not in a
+                ]
+                signature_amenities.sort()
+                room_signature = (
+                    "|".join(signature_amenities)
+                    if signature_amenities
+                    else "STANDARD"
+                )
 
-            batch_results = await fetch_theaters_batch_js(
-                page,
-                batch_items,
-                worker_id,
-                detailed_logger,
-                rate_limit_events,
-            )
-            reqs_since_refresh += len(batch_items)
-
-            for res_obj in batch_results or []:
-                b_idx = res_obj.get("idx", 0)
-                task_idx, target_state, t = batch_items[b_idx]
-                t_name = t.get("theaterName", "Unknown")
-                t_id = t.get("theaterId")
-                if not t_id:
-                    continue
-
-                raw_data = res_obj.get("data")
-                err_code = res_obj.get("error")
-
-                if err_code is not None or not raw_data:
-                    detailed_logger.error(
-                        f"[Thread-{worker_id}] ⚠️ FAILED TO FETCH THEATER MASTER LIST. Status: {err_code} for {t_name}"
-                    )
-                    continue
-
-                try:
-                    movies = raw_data.get("viewModel", {}).get("movies", []) or []
-                    matching_movies = [
-                        m
-                        for m in movies
-                        if str(m.get("id", "")).strip() in TARGET_MOVIE_IDS_SET
-                    ]
-                    if not matching_movies:
-                        detailed_logger.info(
-                            f"[Thread-{worker_id}] Movie not playing / 0 shows returned for {t_name}"
-                        )
+                for show in amenity.get("showtimes", []) or []:
+                    show_hash = show.get("showtimeHashCode")
+                    if not show_hash:
                         continue
 
-                    print(f"[Thread-{worker_id}] 🎬 Found shows at: {t_name[:40]}")
+                    show_time = show.get("screenReaderTime", "Unknown")
+                    status = show.get("type", "Unknown")
 
-                    if t_id not in local_summary_data:
-                        local_summary_data[t_id] = {
-                            "t_id": t_id,
+                    group_key = (
+                        f"{t_id}_{m_id}_{show_time}_{room_signature}"
+                        if multi_id_mode
+                        else f"{t_id}_{show_time}_{room_signature}"
+                    )
+
+                    if group_key not in grouped_shows:
+                        grouped_shows[group_key] = {
                             "state": target_state,
-                            "name": t_name,
-                            "shows": 0,
+                            "theater": t_name,
+                            "t_id": t_id,
+                            "time": show_time,
+                            "tiers": [],
+                        }
+                    grouped_shows[group_key]["tiers"].append(
+                        {
+                            "hash": show_hash,
+                            "status": status,
+                            "format": show_format,
+                            "format_categories": report_format_categories,
+                            "language": show_language,
+                            "is_dbox": is_dbox,
+                        }
+                    )
+
+    return grouped_shows if grouped_shows else None
+
+
+def evaluate_theater_shows_math(
+    t_id,
+    t_name,
+    target_state,
+    grouped_shows,
+    seat_map_results,
+    combined_cache_lookup,
+    local_hash_cache,
+    local_shows_data,
+    local_summary_data,
+    local_knowledge_base,
+    local_sold_out_queue,
+    local_ignored_shows_log,
+    local_hash_healed_log,
+    local_rate_limit_shows,
+    detailed_logger,
+):
+    if t_id not in local_summary_data:
+        local_summary_data[t_id] = {
+            "t_id": t_id,
+            "state": target_state,
+            "name": t_name,
+            "shows": 0,
+            "total": 0,
+            "booked": 0,
+            "gross": 0.0,
+        }
+
+    t_shows_cnt = 0
+    t_soldout_cnt = 0
+    t_cap_sum = 0
+    t_booked_sum = 0
+    t_gross_sum = 0.0
+    t_healed_cnt = 0
+
+    for group_key, show_info in grouped_shows.items():
+        show_info["valid_tiers"] = []
+        show_info["failed_tiers"] = []
+        for tier in show_info["tiers"]:
+            tier_hash = tier["hash"]
+
+            if (
+                str(tier.get("status", "")).lower() == "soldout"
+                and tier_hash not in seat_map_results
+                and tier_hash in combined_cache_lookup
+            ):
+                tier["status"] = "soldout"
+                show_info["failed_tiers"].append(tier)
+                continue
+
+            seat_response = seat_map_results.get(tier_hash)
+            if (
+                isinstance(seat_response, list)
+                and seat_response
+                and seat_response[0].get("id") == "PerformanceSoldOut"
+            ):
+                tier["status"] = "soldout"
+                show_info["failed_tiers"].append(tier)
+                detailed_logger.info(
+                    f"[{t_id} | {show_info['time']}] Seat map explicitly reports sold out for {tier_hash}."
+                )
+            elif (
+                seat_response
+                and isinstance(seat_response, dict)
+                and "error" not in seat_response
+            ):
+                show_info["valid_tiers"].append(
+                    {
+                        "data": seat_response.get("data", seat_response),
+                        "tier_info": tier,
+                    }
+                )
+            else:
+                if isinstance(seat_response, dict) and seat_response.get("error") in [
+                    403,
+                    429,
+                ]:
+                    current_show_time = show_info.get("time", "Unknown Time")
+                    log_rate_limit_incident(
+                        detailed_logger,
+                        local_rate_limit_shows,
+                        f"Seat Map HTTP {seat_response['error']} after {MAX_API_RETRIES} "
+                        f"attempts: {t_name} - {current_show_time} "
+                        f"[{tier['format']}] (Hash: {tier_hash})",
+                    )
+                show_info["failed_tiers"].append(tier)
+
+    # --- PRE-PASS DEAD ROOM DETECTION ---
+    aud_booked_sets = {}
+    for group_key, show_info in grouped_shows.items():
+        time_booked_seats = {}
+        for saved_tier in show_info["valid_tiers"]:
+            tier_data = saved_tier["data"]
+            aud_id = str(tier_data.get("auditoriumId", "Unknown"))
+            total_dots = len(tier_data.get("seats", []))
+            booked_seats = set()
+            has_front_row = False
+
+            for s in tier_data.get("seats", []):
+                s_id = str(s.get("id", ""))
+                status = s.get("status", "").upper()
+                row_num = s.get("row", -1)
+                if s_id and status != "A":
+                    booked_seats.add(s_id)
+                    if row_num == 1 or (
+                        row_num == -1 and str(s_id).upper().startswith("A")
+                    ):
+                        has_front_row = True
+
+            if aud_id not in time_booked_seats:
+                time_booked_seats[aud_id] = {
+                    "booked": set(),
+                    "total_dots": total_dots,
+                    "has_front_row": False,
+                }
+
+            time_booked_seats[aud_id]["booked"].update(booked_seats)
+            if has_front_row:
+                time_booked_seats[aud_id]["has_front_row"] = True
+
+        for aud_id, data in time_booked_seats.items():
+            aud_booked_sets.setdefault(aud_id, []).append(data)
+
+    aud_dead_room_blocks = {}
+    for aud_id, shows_list in aud_booked_sets.items():
+        if len(shows_list) >= 2:
+            first_show_booked = shows_list[0]["booked"]
+            first_show_total = shows_list[0]["total_dots"]
+            first_show_has_front = shows_list[0]["has_front_row"]
+
+            is_exact_match = all(
+                show["booked"] == first_show_booked for show in shows_list
+            )
+            occupancy = (
+                len(first_show_booked) / first_show_total
+                if first_show_total > 0
+                else 0
+            )
+
+            rule_1 = (
+                is_exact_match
+                and (occupancy < 0.50)
+                and first_show_booked
+                and first_show_has_front
+            )
+            rule_2 = is_exact_match and (occupancy < 0.30) and first_show_booked
+
+            if rule_1 or rule_2:
+                aud_dead_room_blocks[aud_id] = first_show_booked
+                matched_rule = (
+                    "Rule 1 (<50% + FrontRow)" if rule_1 else "Rule 2 (<30% Strict)"
+                )
+                detailed_logger.info(
+                    f"[{t_id} | Aud {aud_id}] 🛑 DEAD ROOM DETECTED ({matched_rule}): "
+                    f"{len(shows_list)} unique shows have the exact same "
+                    f"{len(first_show_booked)} structural blocks."
+                )
+            else:
+                aud_dead_room_blocks[aud_id] = set()
+        else:
+            aud_dead_room_blocks[aud_id] = set()
+
+    # --- EVALUATE EACH SHOW ---
+    for group_idx, (group_key, show_info) in enumerate(grouped_shows.items(), 1):
+        try:
+            show_time = show_info["time"]
+            valid_tiers = show_info["valid_tiers"]
+            failed_tiers = show_info["failed_tiers"]
+
+            if len(valid_tiers) == 0:
+                has_generic_error = any(
+                    ft.get("status", "").lower() != "soldout" for ft in failed_tiers
+                )
+
+                if len(failed_tiers) > 0 and not has_generic_error:
+                    base_failed = [
+                        ft for ft in failed_tiers if not ft.get("is_dbox", False)
+                    ]
+                    dbox_failed = [
+                        ft for ft in failed_tiers if ft.get("is_dbox", False)
+                    ]
+
+                    if not base_failed:
+                        base_failed = dbox_failed
+                        dbox_failed = []
+
+                    for base_tier in base_failed:
+                        paired_tiers = [base_tier]
+                        if dbox_failed:
+                            paired_tiers.append(dbox_failed.pop(0))
+
+                        c_total = 0
+                        c_booked = 0
+                        c_gross = 0.0
+                        c_prices = set()
+                        pair_cached = True
+
+                        for paired_tier in paired_tiers:
+                            tier_hash = paired_tier.get("hash")
+                            if tier_hash not in combined_cache_lookup:
+                                pair_cached = False
+                                break
+
+                            cached = combined_cache_lookup[tier_hash]
+                            capacity = cached["capacity"]
+                            max_gross = cached["max_gross"]
+                            if max_gross == 0 and capacity > 0:
+                                max_gross = capacity * MAX_TIER_PRICE
+
+                            c_total += capacity
+                            if paired_tier.get("status", "").lower() == "soldout":
+                                c_booked += capacity
+                                c_gross += max_gross
+                                if capacity > 0:
+                                    c_prices.add(max_gross / capacity)
+
+                        pair_urls = [
+                            f"https://www.fandango.com/napi/seatMap/{pt['hash']}"
+                            for pt in paired_tiers
+                            if pt.get("hash")
+                        ]
+                        if not pair_cached:
+                            for paired_tier in paired_tiers:
+                                local_sold_out_queue.append(
+                                    {
+                                        "state": target_state,
+                                        "t_id": t_id,
+                                        "theater": t_name,
+                                        "format": paired_tier["format"],
+                                        "format_categories": paired_tier.get(
+                                            "format_categories", []
+                                        ),
+                                        "language": paired_tier.get(
+                                            "language", DEFAULT_LANGUAGE
+                                        ),
+                                        "time": show_time,
+                                        "seat_map_urls": (
+                                            f"https://www.fandango.com/napi/seatMap/{paired_tier.get('hash', '')}"
+                                        ),
+                                    }
+                                )
+                            continue
+
+                        final_format = " / ".join(
+                            sorted({pt["format"] for pt in paired_tiers})
+                        )
+                        final_language = " / ".join(
+                            sorted(
+                                {
+                                    pt.get("language", DEFAULT_LANGUAGE)
+                                    for pt in paired_tiers
+                                }
+                            )
+                        )
+                        urls_str = " | ".join(pair_urls)
+                        price_str = (
+                            " / ".join(sorted([f"${p:.2f}" for p in c_prices]))
+                            if c_prices
+                            else "$0.00"
+                        )
+                        final_status = (
+                            "Sold Out"
+                            if c_booked >= c_total and c_total > 0
+                            else "Available"
+                        )
+
+                        local_shows_data.append(
+                            {
+                                "state": target_state,
+                                "t_id": t_id,
+                                "theater": t_name,
+                                "format": final_format,
+                                "language": final_language,
+                                "time": show_time,
+                                "status": final_status,
+                                "format_categories": combine_report_format_categories(
+                                    paired_tiers
+                                ),
+                                "price_str": price_str,
+                                "total": c_total,
+                                "booked": c_booked,
+                                "gross": c_gross,
+                                "seat_map_urls": urls_str,
+                            }
+                        )
+                        local_summary_data[t_id]["shows"] += 1
+                        local_summary_data[t_id]["total"] += c_total
+                        local_summary_data[t_id]["booked"] += c_booked
+                        local_summary_data[t_id]["gross"] += c_gross
+
+                        t_shows_cnt += 1
+                        if final_status == "Sold Out":
+                            t_soldout_cnt += 1
+                        t_cap_sum += c_total
+                        t_booked_sum += c_booked
+                        t_gross_sum += c_gross
+                        t_healed_cnt += 1
+
+                        detailed_logger.info(
+                            f"[{t_id} | {show_time}] SELF-HEALED via Hash Cache -> "
+                            f"Booked: {c_booked}/{c_total} | Gross: ${c_gross:,.2f}"
+                        )
+                        local_hash_healed_log.append(
+                            f"( {target_state} ) {t_name} - {show_time} [{final_format}] "
+                            f"- Healed {c_total} seats | ${c_gross:,.2f}"
+                        )
+                    continue
+
+                if has_generic_error:
+                    formats_seen = list(set(ft["format"] for ft in failed_tiers))
+                    final_format = (
+                        " / ".join(sorted(formats_seen))
+                        if formats_seen
+                        else "Standard"
+                    )
+                    languages_seen = list(
+                        set(
+                            ft.get("language", DEFAULT_LANGUAGE)
+                            for ft in failed_tiers
+                        )
+                    )
+                    final_language = (
+                        " / ".join(sorted(languages_seen))
+                        if languages_seen
+                        else DEFAULT_LANGUAGE
+                    )
+                    failed_urls = [
+                        f"https://www.fandango.com/napi/seatMap/{ft['hash']}"
+                        for ft in failed_tiers
+                        if ft.get("hash")
+                    ]
+                    urls_str = " | ".join(failed_urls)
+
+                    url_log = f" URL(s): {urls_str}" if urls_str else ""
+                    log_msg = (
+                        f"( {target_state} ) {t_name} - {show_time} [{final_format}] - "
+                        f"This show is available but not able to fetch seats.{url_log}"
+                    )
+                    detailed_logger.info(
+                        f"[{t_id} | {show_time}] Matrix S10: ALL APIs FAILED + 'Available'. {log_msg}"
+                    )
+                    local_ignored_shows_log.append(log_msg)
+
+                    local_shows_data.append(
+                        {
+                            "state": target_state,
+                            "t_id": t_id,
+                            "theater": t_name,
+                            "format": final_format,
+                            "language": final_language,
+                            "time": show_time,
+                            "status": "Available (Map Error)",
+                            "format_categories": combine_report_format_categories(
+                                failed_tiers
+                            ),
+                            "price_str": "$0.00",
                             "total": 0,
                             "booked": 0,
                             "gross": 0.0,
+                            "seat_map_urls": urls_str,
                         }
-
-                    grouped_shows = {}
-                    for target_movie in matching_movies:
-                        m_id = str(target_movie.get("id", "")).strip()
-                        m_title = str(target_movie.get("title", "")).strip()
-
-                        for variant in target_movie.get("variants", []) or []:
-                            raw_header = variant.get("filmFormatHeader", "") or "Standard"
-                            base_format = raw_header.replace(" Format", "").strip()
-                            if not base_format:
-                                base_format = "Standard"
-
-                            for amenity in variant.get("amenityGroups", []) or []:
-                                raw_amenities = [
-                                    am.get("name", "").strip()
-                                    for am in amenity.get("amenities", [])
-                                    if am.get("name")
-                                ]
-                                raw_amenities_upper = [a.upper() for a in raw_amenities]
-                                is_dbox = any(
-                                    "D-BOX" in a or "DBOX" in a for a in raw_amenities_upper
-                                )
-
-                                show_format = base_format
-                                premium_keywords = [
-                                    "XD", "IMAX", "LASER AT AMC", "4DX", "RPX", "D-BOX",
-                                ]
-                                for am_name, am_up in zip(raw_amenities, raw_amenities_upper):
-                                    if (
-                                        any(k in am_up for k in premium_keywords)
-                                        and show_format == base_format
-                                    ):
-                                        show_format = am_name
-                                        break
-                                report_format_categories = classify_report_formats(
-                                    " ".join([base_format, *raw_amenities]),
-                                    base_format,
-                                )
-                                if is_dbox and report_format_categories == ["Standard"]:
-                                    report_format_categories = []
-
-                                show_language = detect_show_language(
-                                    raw_amenities, DEFAULT_LANGUAGE, movie_title=m_title
-                                )
-
-                                signature_amenities = [
-                                    a
-                                    for a in raw_amenities_upper
-                                    if "D-BOX" not in a
-                                    and "DBOX" not in a
-                                    and "RESERVED" not in a
-                                    and "RECLINERS" not in a
-                                    and not re.match(
-                                        rf"^\s*(?:{'|'.join(SUPPORTED_LANGUAGES)})\s+(?:WITH\b|LANGUAGE\b)",
-                                        a,
-                                        re.IGNORECASE,
-                                    )
-                                ]
-                                signature_amenities.sort()
-                                room_signature = (
-                                    "|".join(signature_amenities)
-                                    if signature_amenities
-                                    else "STANDARD"
-                                )
-
-                                for show in amenity.get("showtimes", []) or []:
-                                    show_hash = show.get("showtimeHashCode")
-                                    if not show_hash:
-                                        continue
-
-                                    show_time = show.get("screenReaderTime", "Unknown")
-                                    status = show.get("type", "Unknown")
-
-                                    group_key = (
-                                        f"{t_id}_{m_id}_{show_time}_{room_signature}"
-                                        if multi_id_mode
-                                        else f"{t_id}_{show_time}_{room_signature}"
-                                    )
-
-                                    if group_key not in grouped_shows:
-                                        grouped_shows[group_key] = {
-                                            "state": target_state,
-                                            "theater": t_name,
-                                            "t_id": t_id,
-                                            "time": show_time,
-                                            "tiers": [],
-                                        }
-                                    existing_tier = next(
-                                        (
-                                            tier
-                                            for tier in grouped_shows[group_key]["tiers"]
-                                            if tier["hash"] == show_hash
-                                        ),
-                                        None,
-                                    )
-                                    if existing_tier:
-                                        languages = {
-                                            language.strip()
-                                            for language in (
-                                                existing_tier.get("language", ""),
-                                                show_language,
-                                            )
-                                            if language and language.strip()
-                                        }
-                                        existing_tier["language"] = " / ".join(
-                                            sorted(languages)
-                                        )
-                                    else:
-                                        grouped_shows[group_key]["tiers"].append(
-                                            {
-                                                "hash": show_hash,
-                                                "status": status,
-                                                "format": show_format,
-                                                "format_categories": report_format_categories,
-                                                "language": show_language,
-                                                "is_dbox": is_dbox,
-                                            }
-                                        )
-                except Exception as e:
-                    detailed_logger.error(
-                        f"[Thread-{worker_id}] EXCEPTION parsing theater {t_name}: {e}"
                     )
+                    local_summary_data[t_id]["shows"] += 1
+                    t_shows_cnt += 1
+                    continue
+                else:
+                    for failed_tier in failed_tiers:
+                        local_sold_out_queue.append(
+                            {
+                                "state": target_state,
+                                "t_id": t_id,
+                                "theater": t_name,
+                                "format": failed_tier["format"],
+                                "format_categories": failed_tier.get(
+                                    "format_categories", []
+                                ),
+                                "language": failed_tier.get(
+                                    "language", DEFAULT_LANGUAGE
+                                ),
+                                "time": show_time,
+                                "seat_map_urls": (
+                                    f"https://www.fandango.com/napi/seatMap/{failed_tier.get('hash', '')}"
+                                ),
+                            }
+                        )
                     continue
 
-                # --- PHASE 1: COLLECT & FETCH ALL SEAT MAPS FOR THIS THEATER ---
-                hashes_to_fetch = []
-                for group_key, show_info in grouped_shows.items():
-                    for tier in show_info["tiers"]:
-                        t_hash = tier["hash"]
-                        # Smart Optimization: If already tagged soldout AND in hash cache, skip HTTP call!
-                        if (
-                            str(tier.get("status", "")).lower() == "soldout"
-                            and (t_hash in master_hash_cache or t_hash in local_hash_cache)
-                        ):
-                            continue
-                        hashes_to_fetch.append(t_hash)
+            # 🧠 PHYSICAL OVERLAP CLUSTERING
+            clusters = []
 
-                seat_map_results = await fetch_seatmaps_for_theater_js(
-                    page,
-                    hashes_to_fetch,
-                    worker_id,
-                    detailed_logger,
-                    rate_limit_events,
+            def get_available_seat_ids(s_array):
+                return set(
+                    s.get("id")
+                    for s in s_array
+                    if s.get("id") and s.get("status") == "A"
                 )
-                reqs_since_refresh += len(hashes_to_fetch)
 
-                for group_key, show_info in grouped_shows.items():
-                    show_info["valid_tiers"] = []
-                    show_info["failed_tiers"] = []
-                    for tier in show_info["tiers"]:
-                        tier_hash = tier["hash"]
+            for vt in valid_tiers:
+                seats_array = vt["data"].get("seats", [])
+                seat_ids = set(s.get("id") for s in seats_array if s.get("id"))
+                vt_available_seats = get_available_seat_ids(seats_array)
 
-                        # Fast path for cached SoldOut showtimes
-                        if (
-                            str(tier.get("status", "")).lower() == "soldout"
-                            and tier_hash not in seat_map_results
-                            and (tier_hash in master_hash_cache or tier_hash in local_hash_cache)
-                        ):
-                            tier["status"] = "soldout"
-                            show_info["failed_tiers"].append(tier)
-                            continue
+                matched = False
+                for cluster in clusters:
+                    vt_svg = vt["data"].get("backgroundSvg", "")
+                    cluster_svg = cluster["tiers"][0]["data"].get(
+                        "backgroundSvg", ""
+                    )
 
-                        seat_response = seat_map_results.get(tier_hash)
-                        if (
-                            isinstance(seat_response, list)
-                            and seat_response
-                            and seat_response[0].get("id") == "PerformanceSoldOut"
-                        ):
-                            tier["status"] = "soldout"
-                            show_info["failed_tiers"].append(tier)
-                            detailed_logger.info(
-                                f"[{t_id} | {show_info['time']}] Seat map explicitly reports sold out for {tier_hash}."
+                    has_intersection = bool(
+                        seat_ids and cluster["seat_ids"].intersection(seat_ids)
+                    )
+                    has_same_svg = bool(
+                        vt_svg and cluster_svg and vt_svg == cluster_svg
+                    )
+
+                    if has_intersection or has_same_svg:
+                        has_collision = False
+                        for existing_vt in cluster["tiers"]:
+                            existing_available_seats = get_available_seat_ids(
+                                existing_vt["data"].get("seats", [])
                             )
-                        elif (
-                            seat_response
-                            and isinstance(seat_response, dict)
-                            and "error" not in seat_response
-                        ):
-                            show_info["valid_tiers"].append(
+                            if vt_available_seats.intersection(
+                                existing_available_seats
+                            ):
+                                has_collision = True
+                                break
+
+                        if not has_collision:
+                            cluster["tiers"].append(vt)
+                            cluster["seat_ids"].update(seat_ids)
+                            matched = True
+                            break
+
+                if not matched:
+                    clusters.append(
+                        {"seat_ids": seat_ids, "tiers": [vt], "failed_tiers": []}
+                    )
+
+            failed_bases = [ft for ft in failed_tiers if not ft.get("is_dbox")]
+            failed_dboxes = [ft for ft in failed_tiers if ft.get("is_dbox")]
+
+            for failed_dbox in failed_dboxes:
+                for cluster in clusters:
+                    cluster_has_dbox = any(
+                        t["tier_info"].get("is_dbox") for t in cluster["tiers"]
+                    ) or any(t.get("is_dbox") for t in cluster["failed_tiers"])
+                    if not cluster_has_dbox:
+                        cluster["failed_tiers"].append(failed_dbox)
+                        break
+                else:
+                    clusters.append(
+                        {"seat_ids": set(), "tiers": [], "failed_tiers": [failed_dbox]}
+                    )
+
+            for failed_base in failed_bases:
+                for cluster in clusters:
+                    cluster_has_base = any(
+                        not t["tier_info"].get("is_dbox") for t in cluster["tiers"]
+                    ) or any(not t.get("is_dbox") for t in cluster["failed_tiers"])
+                    if not cluster_has_base:
+                        cluster["failed_tiers"].append(failed_base)
+                        break
+                else:
+                    clusters.append(
+                        {"seat_ids": set(), "tiers": [], "failed_tiers": [failed_base]}
+                    )
+
+            # 🎬 THE MASTER MATRIX (UNIFIED ALLOCATION ALGORITHM)
+            for c_idx, cluster in enumerate(clusters):
+                combined_total = combined_booked = 0
+                combined_gross = 0.0
+                prices_seen = set()
+                formats_seen = set()
+                languages_seen = set()
+                matrix_urls = []
+
+                for vt in cluster["tiers"]:
+                    formats_seen.add(vt["tier_info"]["format"])
+                    languages_seen.add(vt["tier_info"]["language"])
+                    if vt["tier_info"].get("hash"):
+                        matrix_urls.append(
+                            f"https://www.fandango.com/napi/seatMap/{vt['tier_info']['hash']}"
+                        )
+                for ft in cluster["failed_tiers"]:
+                    formats_seen.add(ft["format"])
+                    if "language" in ft:
+                        languages_seen.add(ft["language"])
+                    if ft.get("hash"):
+                        matrix_urls.append(
+                            f"https://www.fandango.com/napi/seatMap/{ft['hash']}"
+                        )
+
+                matrix_urls_str = " | ".join(matrix_urls)
+                final_format = " / ".join(sorted(formats_seen))
+                final_language = (
+                    " / ".join(sorted(languages_seen))
+                    if languages_seen
+                    else DEFAULT_LANGUAGE
+                )
+
+                uid_log = f"[{t_id} | {show_time} | {final_format}]"
+                is_multi_tier = (
+                    len(cluster["tiers"]) + len(cluster["failed_tiers"])
+                ) > 1
+
+                healed_tiers_info = []
+
+                if not cluster["tiers"]:
+                    has_available_failed_tiers = any(
+                        failed_tier.get("status", "").lower() != "soldout"
+                        for failed_tier in cluster["failed_tiers"]
+                    )
+                    for failed_tier in cluster["failed_tiers"]:
+                        tier_hash = failed_tier.get("hash")
+                        is_soldout = (
+                            failed_tier.get("status", "").lower() == "soldout"
+                        )
+                        if tier_hash in combined_cache_lookup:
+                            cached = combined_cache_lookup[tier_hash]
+                            capacity = cached["capacity"]
+                            max_gross = cached["max_gross"]
+                            if max_gross == 0 and capacity > 0:
+                                max_gross = capacity * MAX_TIER_PRICE
+                            combined_total += capacity
+                            if is_soldout:
+                                combined_booked += capacity
+                                combined_gross += max_gross
+                                if capacity > 0:
+                                    prices_seen.add(max_gross / capacity)
+                            calc_method_log = "Standalone: Hash Healed"
+                            healed_tiers_info.append(
+                                f"[{failed_tier['format']}] {capacity} seats | ${max_gross:,.2f}"
+                            )
+                        elif is_soldout:
+                            local_sold_out_queue.append(
                                 {
-                                    "data": seat_response.get("data", seat_response),
-                                    "tier_info": tier,
+                                    "state": target_state,
+                                    "t_id": t_id,
+                                    "theater": t_name,
+                                    "format": failed_tier["format"],
+                                    "format_categories": failed_tier.get(
+                                        "format_categories", []
+                                    ),
+                                    "language": failed_tier.get(
+                                        "language", DEFAULT_LANGUAGE
+                                    ),
+                                    "time": show_time,
+                                    "seat_map_urls": f"https://www.fandango.com/napi/seatMap/{tier_hash or ''}",
                                 }
                             )
-                        else:
-                            show_info["failed_tiers"].append(tier)
 
-                # --- PHASE 2: PRE-PASS DEAD ROOM DETECTION ---
-                aud_booked_sets = {}
-                for group_key, show_info in grouped_shows.items():
-                    time_booked_seats = {}
-                    for saved_tier in show_info["valid_tiers"]:
-                        tier_data = saved_tier["data"]
-                        aud_id = str(tier_data.get("auditoriumId", "Unknown"))
-                        total_dots = len(tier_data.get("seats", []))
-                        booked_seats = set()
-                        has_front_row = False
+                    if combined_total == 0:
+                        continue
 
-                        for s in tier_data.get("seats", []):
-                            s_id = str(s.get("id", ""))
-                            status = s.get("status", "").upper()
-                            row_num = s.get("row", -1)
-                            if s_id and status != "A":
-                                booked_seats.add(s_id)
-                                if row_num == 1 or (
-                                    row_num == -1 and str(s_id).upper().startswith("A")
-                                ):
-                                    has_front_row = True
-
-                        if aud_id not in time_booked_seats:
-                            time_booked_seats[aud_id] = {
-                                "booked": set(),
-                                "total_dots": total_dots,
-                                "has_front_row": False,
+                    if combined_total > 0:
+                        kb_key = f"{t_id}_{final_format}"
+                        if kb_key not in local_knowledge_base:
+                            local_knowledge_base[kb_key] = {
+                                "total_seats_sum": 0,
+                                "count": 0,
+                                "prices": set(),
                             }
+                        local_knowledge_base[kb_key][
+                            "total_seats_sum"
+                        ] += combined_total
+                        local_knowledge_base[kb_key]["count"] += 1
+                        local_knowledge_base[kb_key]["prices"].update(prices_seen)
 
-                        time_booked_seats[aud_id]["booked"].update(booked_seats)
-                        if has_front_row:
-                            time_booked_seats[aud_id]["has_front_row"] = True
+                    final_status = _get_show_status(
+                        combined_booked,
+                        combined_total,
+                        has_available_failed_tiers,
+                    )
+                    price_str = (
+                        " / ".join(sorted(f"${price:.2f}" for price in prices_seen))
+                        if prices_seen
+                        else "$0.00"
+                    )
+                    local_hash_healed_log.append(
+                        f"( {target_state} ) {t_name} - {show_time} [{final_format}] "
+                        f"- Healed {combined_total} seats | ${combined_gross:,.2f}"
+                    )
+                    local_shows_data.append(
+                        {
+                            "state": target_state,
+                            "t_id": t_id,
+                            "theater": t_name,
+                            "format": final_format,
+                            "language": final_language,
+                            "time": show_time,
+                            "status": final_status,
+                            "format_categories": combine_report_format_categories(
+                                [ft["tier_info"] for ft in cluster["tiers"]]
+                                + cluster["failed_tiers"]
+                            ),
+                            "price_str": price_str,
+                            "total": combined_total,
+                            "booked": combined_booked,
+                            "gross": combined_gross,
+                            "seat_map_urls": matrix_urls_str,
+                        }
+                    )
+                    local_summary_data[t_id]["shows"] += 1
+                    local_summary_data[t_id]["total"] += combined_total
+                    local_summary_data[t_id]["booked"] += combined_booked
+                    local_summary_data[t_id]["gross"] += combined_gross
 
-                    for aud_id, data in time_booked_seats.items():
-                        if aud_id not in aud_booked_sets:
-                            aud_booked_sets[aud_id] = []
-                        aud_booked_sets[aud_id].append(data)
+                    t_shows_cnt += 1
+                    if final_status == "Sold Out":
+                        t_soldout_cnt += 1
+                    t_cap_sum += combined_total
+                    t_booked_sum += combined_booked
+                    t_gross_sum += combined_gross
+                    t_healed_cnt += 1
+                    continue
 
-                aud_dead_room_blocks = {}
-                for aud_id, shows_list in aud_booked_sets.items():
-                    if len(shows_list) >= 2:
-                        first_show_booked = shows_list[0]["booked"]
-                        first_show_total = shows_list[0]["total_dots"]
-                        first_show_has_front = shows_list[0]["has_front_row"]
+                base_vt = None
+                valid_base_tiers = [
+                    vt
+                    for vt in cluster["tiers"]
+                    if not vt["tier_info"].get("is_dbox")
+                ]
+                if valid_base_tiers:
+                    valid_base_tiers.sort(
+                        key=lambda vt: int(
+                            vt["data"]
+                            .get("areas", [{}])[0]
+                            .get("totalSeatCount", 0)
+                        )
+                        if vt.get("data", {}).get("areas")
+                        else 0,
+                        reverse=True,
+                    )
+                    base_vt = valid_base_tiers[0]
+                elif cluster["tiers"]:
+                    base_vt = cluster["tiers"][0]
 
-                        is_exact_match = all(
-                            show["booked"] == first_show_booked for show in shows_list
+                safe_avg_price = AVG_PRICE
+                if PRICE_TAX_CUT and safe_avg_price > 0:
+                    safe_avg_price = float((safe_avg_price // 5) * 5)
+
+                base_seats = base_vt["data"].get("seats", [])
+                base_phys_total_dots = sum(
+                    1
+                    for s in base_seats
+                    if s.get("status", "").upper() in ["A", "R"]
+                )
+                base_has_valid_area = any(s.get("areaId") for s in base_seats)
+
+                # --- 🌟 THE PHANTOM SEAT SUBTRACTOR (AREA-BY-AREA) 🌟 ---
+                allocated_cap = 0
+                allocated_booked = 0
+                allocated_gross = 0.0
+
+                for vt in cluster["tiers"]:
+                    vt_seats = vt["data"].get("seats", [])
+                    aud_id = str(vt["data"].get("auditoriumId", "Unknown"))
+                    dead_room_seats = aud_dead_room_blocks.get(aud_id, set())
+
+                    area_stats = {}
+                    for a in vt["data"].get("areas", []):
+                        a_id = str(a.get("id", ""))
+                        try:
+                            p = float(
+                                a.get("ticketInfo", [{}])[0].get("price", 0)
+                            )
+                            if PRICE_TAX_CUT and p > 0:
+                                p = float((p // 5) * 5)
+                        except Exception:
+                            p = 0.0
+
+                        area_stats[a_id] = {
+                            "cache_cap": int(a.get("totalSeatCount", 0)),
+                            "cache_avail": int(a.get("availableSeatCount", 0)),
+                            "price": p,
+                            "phys_total": 0,
+                            "raw_booked": 0,
+                            "explicit_blocks": 0,
+                            "front_row_blocks": 0,
+                            "explicit_in_front_row": 0,
+                            "dead_room_blocks": 0,
+                        }
+
+                    if vt_seats:
+                        temp_phys_total = sum(
+                            1
+                            for s in vt_seats
+                            if s.get("status", "").upper() in ["A", "R"]
+                        )
+                        temp_phys_booked = sum(
+                            1
+                            for s in vt_seats
+                            if s.get("status", "").upper() == "R"
                         )
                         occupancy = (
-                            len(first_show_booked) / first_show_total
-                            if first_show_total > 0
-                            else 0
+                            (temp_phys_booked / temp_phys_total)
+                            if temp_phys_total > 0
+                            else 0.0
                         )
 
-                        rule_1 = (
-                            is_exact_match
-                            and (occupancy < 0.50)
-                            and first_show_booked
-                            and first_show_has_front
-                        )
-                        rule_2 = (
-                            is_exact_match and (occupancy < 0.30) and first_show_booked
-                        )
+                        for s in vt_seats:
+                            status = s.get("status", "").upper()
+                            s_id = s.get("id", "")
+                            row_num = s.get("row", -1)
+                            a_id = str(s.get("areaId", ""))
 
-                        if rule_1 or rule_2:
-                            aud_dead_room_blocks[aud_id] = first_show_booked
-                            matched_rule = (
-                                "Rule 1 (<50% + FrontRow)"
-                                if rule_1
-                                else "Rule 2 (<30% Strict)"
-                            )
-                            detailed_logger.info(
-                                f"[{t_id} | Aud {aud_id}] 🛑 DEAD ROOM DETECTED ({matched_rule}): "
-                                f"{len(shows_list)} unique shows have the exact same "
-                                f"{len(first_show_booked)} structural blocks."
-                            )
-                        else:
-                            aud_dead_room_blocks[aud_id] = set()
-                    else:
-                        aud_dead_room_blocks[aud_id] = set()
-
-                # --- PHASE 3: PROCESS EACH SHOW (EXACT MATRIX & PHANTOM MATH) ---
-                combined_cache_lookup = {**master_hash_cache, **local_hash_cache}
-
-                for group_idx, (group_key, show_info) in enumerate(
-                    grouped_shows.items(), 1
-                ):
-                    try:
-                        show_time = show_info["time"]
-                        valid_tiers = show_info["valid_tiers"]
-                        failed_tiers = show_info["failed_tiers"]
-
-                        # 🚨 MATRIX SCENARIOS 9 & 10: ALL APIs FAILED
-                        if len(valid_tiers) == 0:
-                            has_generic_error = any(
-                                ft.get("status", "").lower() != "soldout"
-                                for ft in failed_tiers
-                            )
-
-                            # ✨ HASH CACHE SELF-HEALING (All Tiers Failed)
-                            if len(failed_tiers) > 0 and not has_generic_error:
-                                base_failed = [
-                                    ft
-                                    for ft in failed_tiers
-                                    if not ft.get("is_dbox", False)
-                                ]
-                                dbox_failed = [
-                                    ft for ft in failed_tiers if ft.get("is_dbox", False)
-                                ]
-
-                                if not base_failed:
-                                    base_failed = dbox_failed
-                                    dbox_failed = []
-
-                                for base_tier in base_failed:
-                                    paired_tiers = [base_tier]
-                                    if dbox_failed:
-                                        paired_tiers.append(dbox_failed.pop(0))
-
-                                    c_total = 0
-                                    c_booked = 0
-                                    c_gross = 0.0
-                                    c_prices = set()
-                                    pair_cached = True
-
-                                    for paired_tier in paired_tiers:
-                                        tier_hash = paired_tier.get("hash")
-                                        if tier_hash not in combined_cache_lookup:
-                                            pair_cached = False
-                                            break
-
-                                        cached = combined_cache_lookup[tier_hash]
-                                        capacity = cached["capacity"]
-                                        max_gross = cached["max_gross"]
-                                        if max_gross == 0 and capacity > 0:
-                                            max_gross = capacity * MAX_TIER_PRICE
-
-                                        c_total += capacity
-                                        if (
-                                            paired_tier.get("status", "").lower()
-                                            == "soldout"
-                                        ):
-                                            c_booked += capacity
-                                            c_gross += max_gross
-                                            if capacity > 0:
-                                                c_prices.add(max_gross / capacity)
-
-                                    pair_urls = [
-                                        f"https://www.fandango.com/napi/seatMap/{pt['hash']}"
-                                        for pt in paired_tiers
-                                        if pt.get("hash")
-                                    ]
-                                    if not pair_cached:
-                                        for paired_tier in paired_tiers:
-                                            local_sold_out_queue.append(
-                                                {
-                                                    "state": target_state,
-                                                    "t_id": t_id,
-                                                    "theater": t_name,
-                                                    "format": paired_tier["format"],
-                                                    "format_categories": paired_tier.get(
-                                                        "format_categories", []
-                                                    ),
-                                                    "language": paired_tier.get(
-                                                        "language", DEFAULT_LANGUAGE
-                                                    ),
-                                                    "time": show_time,
-                                                    "seat_map_urls": (
-                                                        f"https://www.fandango.com/napi/seatMap/{paired_tier.get('hash', '')}"
-                                                    ),
-                                                }
-                                            )
-                                        continue
-
-                                    final_format = " / ".join(
-                                        sorted({pt["format"] for pt in paired_tiers})
-                                    )
-                                    final_language = " / ".join(
-                                        sorted(
-                                            {
-                                                pt.get("language", DEFAULT_LANGUAGE)
-                                                for pt in paired_tiers
-                                            }
-                                        )
-                                    )
-                                    urls_str = " | ".join(pair_urls)
-                                    price_str = (
-                                        " / ".join(
-                                            sorted([f"${p:.2f}" for p in c_prices])
-                                        )
-                                        if c_prices
-                                        else "$0.00"
-                                    )
-                                    final_status = (
-                                        "Sold Out"
-                                        if c_booked >= c_total and c_total > 0
-                                        else "Available"
-                                    )
-
-                                    local_shows_data.append(
-                                        {
-                                            "state": target_state,
-                                            "t_id": t_id,
-                                            "theater": t_name,
-                                            "format": final_format,
-                                            "language": final_language,
-                                            "time": show_time,
-                                            "status": final_status,
-                                            "format_categories": combine_report_format_categories(
-                                                paired_tiers
-                                            ),
-                                            "price_str": price_str,
-                                            "total": c_total,
-                                            "booked": c_booked,
-                                            "gross": c_gross,
-                                            "seat_map_urls": urls_str,
-                                        }
-                                    )
-                                    local_summary_data[t_id]["shows"] += 1
-                                    local_summary_data[t_id]["total"] += c_total
-                                    local_summary_data[t_id]["booked"] += c_booked
-                                    local_summary_data[t_id]["gross"] += c_gross
-                                    detailed_logger.info(
-                                        f"[{t_id} | {show_time}] SELF-HEALED (All-Failed) via Hash Cache. "
-                                        f"Booked: {c_booked}/{c_total}"
-                                    )
-                                    local_hash_healed_log.append(
-                                        f"( {target_state} ) {t_name} - {show_time} [{final_format}] "
-                                        f"- Healed {c_total} seats | ${c_gross:,.2f}"
-                                    )
-
-                                continue
-
-                            if has_generic_error:
-                                formats_seen = list(
-                                    set(ft["format"] for ft in failed_tiers)
+                            if a_id not in area_stats:
+                                first_a_id = (
+                                    list(area_stats.keys())[0]
+                                    if area_stats
+                                    else "UNKNOWN"
                                 )
-                                final_format = (
-                                    " / ".join(sorted(formats_seen))
-                                    if formats_seen
-                                    else "Standard"
-                                )
-                                languages_seen = list(
-                                    set(
-                                        ft.get("language", DEFAULT_LANGUAGE)
-                                        for ft in failed_tiers
-                                    )
-                                )
-                                final_language = (
-                                    " / ".join(sorted(languages_seen))
-                                    if languages_seen
-                                    else DEFAULT_LANGUAGE
-                                )
-                                failed_urls = [
-                                    f"https://www.fandango.com/napi/seatMap/{ft['hash']}"
-                                    for ft in failed_tiers
-                                    if ft.get("hash")
-                                ]
-                                urls_str = " | ".join(failed_urls)
-
-                                url_log = f" URL(s): {urls_str}" if urls_str else ""
-                                log_msg = (
-                                    f"( {target_state} ) {t_name} - {show_time} [{final_format}] - "
-                                    f"This show is available but not able to fetch seats.{url_log}"
-                                )
-                                detailed_logger.info(
-                                    f"[{t_id} | {show_time}] Matrix S10: ALL APIs FAILED + 'Available'. {log_msg}"
-                                )
-                                local_ignored_shows_log.append(log_msg)
-
-                                local_shows_data.append(
-                                    {
-                                        "state": target_state,
-                                        "t_id": t_id,
-                                        "theater": t_name,
-                                        "format": final_format,
-                                        "language": final_language,
-                                        "time": show_time,
-                                        "status": "Available (Map Error)",
-                                        "format_categories": combine_report_format_categories(
-                                            failed_tiers
-                                        ),
-                                        "price_str": "$0.00",
-                                        "total": 0,
-                                        "booked": 0,
-                                        "gross": 0.0,
-                                        "seat_map_urls": urls_str,
-                                    }
-                                )
-
-                                local_summary_data[t_id]["shows"] += 1
-                                continue
-                            else:
-                                for failed_tier in failed_tiers:
-                                    local_sold_out_queue.append(
-                                        {
-                                            "state": target_state,
-                                            "t_id": t_id,
-                                            "theater": t_name,
-                                            "format": failed_tier["format"],
-                                            "format_categories": failed_tier.get(
-                                                "format_categories", []
-                                            ),
-                                            "language": failed_tier.get(
-                                                "language", DEFAULT_LANGUAGE
-                                            ),
-                                            "time": show_time,
-                                            "seat_map_urls": (
-                                                f"https://www.fandango.com/napi/seatMap/{failed_tier.get('hash', '')}"
-                                            ),
-                                        }
-                                    )
-                                continue
-
-                        # 🧠 PHYSICAL OVERLAP CLUSTERING
-                        clusters = []
-
-                        def get_available_seat_ids(s_array):
-                            return set(
-                                s.get("id")
-                                for s in s_array
-                                if s.get("id") and s.get("status") == "A"
-                            )
-
-                        for vt in valid_tiers:
-                            seats_array = vt["data"].get("seats", [])
-                            seat_ids = set(
-                                s.get("id") for s in seats_array if s.get("id")
-                            )
-                            vt_available_seats = get_available_seat_ids(seats_array)
-
-                            matched = False
-                            for cluster in clusters:
-                                vt_svg = vt["data"].get("backgroundSvg", "")
-                                cluster_svg = cluster["tiers"][0]["data"].get(
-                                    "backgroundSvg", ""
-                                )
-
-                                has_intersection = bool(
-                                    seat_ids
-                                    and cluster["seat_ids"].intersection(seat_ids)
-                                )
-                                has_same_svg = bool(
-                                    vt_svg and cluster_svg and vt_svg == cluster_svg
-                                )
-
-                                if has_intersection or has_same_svg:
-                                    has_collision = False
-                                    for existing_vt in cluster["tiers"]:
-                                        existing_available_seats = (
-                                            get_available_seat_ids(
-                                                existing_vt["data"].get("seats", [])
-                                            )
-                                        )
-                                        if vt_available_seats.intersection(
-                                            existing_available_seats
-                                        ):
-                                            has_collision = True
-                                            break
-
-                                    if not has_collision:
-                                        cluster["tiers"].append(vt)
-                                        cluster["seat_ids"].update(seat_ids)
-                                        matched = True
-                                        break
-
-                            if not matched:
-                                clusters.append(
-                                    {
-                                        "seat_ids": seat_ids,
-                                        "tiers": [vt],
-                                        "failed_tiers": [],
-                                    }
-                                )
-
-                        failed_bases = [
-                            ft for ft in failed_tiers if not ft.get("is_dbox")
-                        ]
-                        failed_dboxes = [
-                            ft for ft in failed_tiers if ft.get("is_dbox")
-                        ]
-
-                        for failed_dbox in failed_dboxes:
-                            for cluster in clusters:
-                                cluster_has_dbox = any(
-                                    t["tier_info"].get("is_dbox")
-                                    for t in cluster["tiers"]
-                                ) or any(
-                                    t.get("is_dbox") for t in cluster["failed_tiers"]
-                                )
-                                if not cluster_has_dbox:
-                                    cluster["failed_tiers"].append(failed_dbox)
-                                    break
-                            else:
-                                clusters.append(
-                                    {
-                                        "seat_ids": set(),
-                                        "tiers": [],
-                                        "failed_tiers": [failed_dbox],
-                                    }
-                                )
-
-                        for failed_base in failed_bases:
-                            for cluster in clusters:
-                                cluster_has_base = any(
-                                    not t["tier_info"].get("is_dbox")
-                                    for t in cluster["tiers"]
-                                ) or any(
-                                    not t.get("is_dbox")
-                                    for t in cluster["failed_tiers"]
-                                )
-                                if not cluster_has_base:
-                                    cluster["failed_tiers"].append(failed_base)
-                                    break
-                            else:
-                                clusters.append(
-                                    {
-                                        "seat_ids": set(),
-                                        "tiers": [],
-                                        "failed_tiers": [failed_base],
-                                    }
-                                )
-
-                        # 🎬 THE MASTER MATRIX (UNIFIED ALLOCATION ALGORITHM)
-                        for c_idx, cluster in enumerate(clusters):
-                            combined_total = combined_booked = 0
-                            combined_gross = 0.0
-                            prices_seen = set()
-                            formats_seen = set()
-                            languages_seen = set()
-                            matrix_urls = []
-
-                            for vt in cluster["tiers"]:
-                                formats_seen.add(vt["tier_info"]["format"])
-                                languages_seen.add(vt["tier_info"]["language"])
-                                if vt["tier_info"].get("hash"):
-                                    matrix_urls.append(
-                                        f"https://www.fandango.com/napi/seatMap/{vt['tier_info']['hash']}"
-                                    )
-                            for ft in cluster["failed_tiers"]:
-                                formats_seen.add(ft["format"])
-                                if "language" in ft:
-                                    languages_seen.add(ft["language"])
-                                if ft.get("hash"):
-                                    matrix_urls.append(
-                                        f"https://www.fandango.com/napi/seatMap/{ft['hash']}"
-                                    )
-
-                            matrix_urls_str = " | ".join(matrix_urls)
-                            final_format = " / ".join(sorted(formats_seen))
-                            final_language = (
-                                " / ".join(sorted(languages_seen))
-                                if languages_seen
-                                else DEFAULT_LANGUAGE
-                            )
-
-                            uid_log = f"[{t_id} | {show_time} | {final_format}]"
-                            is_multi_tier = (
-                                len(cluster["tiers"]) + len(cluster["failed_tiers"])
-                            ) > 1
-
-                            healed_tiers_info = []
-
-                            if not cluster["tiers"]:
-                                has_available_failed_tiers = any(
-                                    failed_tier.get("status", "").lower() != "soldout"
-                                    for failed_tier in cluster["failed_tiers"]
-                                )
-                                for failed_tier in cluster["failed_tiers"]:
-                                    tier_hash = failed_tier.get("hash")
-                                    is_soldout = (
-                                        failed_tier.get("status", "").lower()
-                                        == "soldout"
-                                    )
-                                    if tier_hash in combined_cache_lookup:
-                                        cached = combined_cache_lookup[tier_hash]
-                                        capacity = cached["capacity"]
-                                        max_gross = cached["max_gross"]
-                                        if max_gross == 0 and capacity > 0:
-                                            max_gross = capacity * MAX_TIER_PRICE
-                                        combined_total += capacity
-                                        if is_soldout:
-                                            combined_booked += capacity
-                                            combined_gross += max_gross
-                                            if capacity > 0:
-                                                prices_seen.add(max_gross / capacity)
-                                        calc_method_log = "Standalone: Hash Healed"
-                                        healed_tiers_info.append(
-                                            f"[{failed_tier['format']}] {capacity} seats | ${max_gross:,.2f}"
-                                        )
-                                    elif is_soldout:
-                                        local_sold_out_queue.append(
-                                            {
-                                                "state": target_state,
-                                                "t_id": t_id,
-                                                "theater": t_name,
-                                                "format": failed_tier["format"],
-                                                "format_categories": failed_tier.get(
-                                                    "format_categories", []
-                                                ),
-                                                "language": failed_tier.get(
-                                                    "language", DEFAULT_LANGUAGE
-                                                ),
-                                                "time": show_time,
-                                                "seat_map_urls": f"https://www.fandango.com/napi/seatMap/{tier_hash or ''}",
-                                            }
-                                        )
-
-                                if combined_total == 0:
-                                    continue
-
-                                if combined_total > 0:
-                                    kb_key = f"{t_id}_{final_format}"
-                                    if kb_key not in local_knowledge_base:
-                                        local_knowledge_base[kb_key] = {
-                                            "total_seats_sum": 0,
-                                            "count": 0,
-                                            "prices": set(),
-                                        }
-                                    local_knowledge_base[kb_key][
-                                        "total_seats_sum"
-                                    ] += combined_total
-                                    local_knowledge_base[kb_key]["count"] += 1
-                                    local_knowledge_base[kb_key]["prices"].update(
-                                        prices_seen
-                                    )
-
-                                final_status = _get_show_status(
-                                    combined_booked,
-                                    combined_total,
-                                    has_available_failed_tiers,
-                                )
-                                price_str = (
-                                    " / ".join(
-                                        sorted(f"${price:.2f}" for price in prices_seen)
-                                    )
-                                    if prices_seen
-                                    else "$0.00"
-                                )
-                                local_hash_healed_log.append(
-                                    f"( {target_state} ) {t_name} - {show_time} [{final_format}] "
-                                    f"- Healed {combined_total} seats | ${combined_gross:,.2f}"
-                                )
-                                local_shows_data.append(
-                                    {
-                                        "state": target_state,
-                                        "t_id": t_id,
-                                        "theater": t_name,
-                                        "format": final_format,
-                                        "language": final_language,
-                                        "time": show_time,
-                                        "status": final_status,
-                                        "format_categories": combine_report_format_categories(
-                                            [
-                                                ft["tier_info"]
-                                                for ft in cluster["tiers"]
-                                            ]
-                                            + cluster["failed_tiers"]
-                                        ),
-                                        "price_str": price_str,
-                                        "total": combined_total,
-                                        "booked": combined_booked,
-                                        "gross": combined_gross,
-                                        "seat_map_urls": matrix_urls_str,
-                                    }
-                                )
-                                local_summary_data[t_id]["shows"] += 1
-                                local_summary_data[t_id]["total"] += combined_total
-                                local_summary_data[t_id]["booked"] += combined_booked
-                                local_summary_data[t_id]["gross"] += combined_gross
-                                continue
-
-                            base_vt = None
-                            valid_base_tiers = [
-                                vt
-                                for vt in cluster["tiers"]
-                                if not vt["tier_info"].get("is_dbox")
-                            ]
-                            if valid_base_tiers:
-                                valid_base_tiers.sort(
-                                    key=lambda vt: int(
-                                        vt["data"]
-                                        .get("areas", [{}])[0]
-                                        .get("totalSeatCount", 0)
-                                    )
-                                    if vt.get("data", {}).get("areas")
-                                    else 0,
-                                    reverse=True,
-                                )
-                                base_vt = valid_base_tiers[0]
-                            elif cluster["tiers"]:
-                                base_vt = cluster["tiers"][0]
-
-                            safe_avg_price = AVG_PRICE
-                            if PRICE_TAX_CUT and safe_avg_price > 0:
-                                safe_avg_price = float((safe_avg_price // 5) * 5)
-
-                            base_seats = base_vt["data"].get("seats", [])
-                            base_phys_total_dots = sum(
-                                1
-                                for s in base_seats
-                                if s.get("status", "").upper() in ["A", "R"]
-                            )
-                            base_has_valid_area = any(
-                                s.get("areaId") for s in base_seats
-                            )
-
-                            # --- 🌟 THE PHANTOM SEAT SUBTRACTOR (AREA-BY-AREA) 🌟 ---
-                            allocated_cap = 0
-                            allocated_booked = 0
-                            allocated_gross = 0.0
-
-                            for vt in cluster["tiers"]:
-                                vt_seats = vt["data"].get("seats", [])
-                                aud_id = str(vt["data"].get("auditoriumId", "Unknown"))
-                                dead_room_seats = aud_dead_room_blocks.get(
-                                    aud_id, set()
-                                )
-
-                                area_stats = {}
-                                for a in vt["data"].get("areas", []):
-                                    a_id = str(a.get("id", ""))
-                                    try:
-                                        p = float(
-                                            a.get("ticketInfo", [{}])[0].get(
-                                                "price", 0
-                                            )
-                                        )
-                                        if PRICE_TAX_CUT and p > 0:
-                                            p = float((p // 5) * 5)
-                                    except Exception:
-                                        p = 0.0
-
-                                    area_stats[a_id] = {
-                                        "cache_cap": int(a.get("totalSeatCount", 0)),
-                                        "cache_avail": int(
-                                            a.get("availableSeatCount", 0)
-                                        ),
-                                        "price": p,
+                                if first_a_id not in area_stats:
+                                    area_stats[first_a_id] = {
+                                        "cache_cap": 0,
+                                        "cache_avail": 0,
+                                        "price": 0.0,
                                         "phys_total": 0,
                                         "raw_booked": 0,
                                         "explicit_blocks": 0,
@@ -1962,380 +2005,589 @@ async def process_theaters_worker_async(
                                         "explicit_in_front_row": 0,
                                         "dead_room_blocks": 0,
                                     }
+                                a_id = first_a_id
 
-                                if vt_seats:
-                                    temp_phys_total = sum(
-                                        1
-                                        for s in vt_seats
-                                        if s.get("status", "").upper() in ["A", "R"]
-                                    )
-                                    temp_phys_booked = sum(
-                                        1
-                                        for s in vt_seats
-                                        if s.get("status", "").upper() == "R"
-                                    )
-                                    occupancy = (
-                                        (temp_phys_booked / temp_phys_total)
-                                        if temp_phys_total > 0
-                                        else 0.0
-                                    )
+                            ast = area_stats[a_id]
+                            ast["phys_total"] += 1
 
-                                    for s in vt_seats:
-                                        status = s.get("status", "").upper()
-                                        s_id = s.get("id", "")
-                                        row_num = s.get("row", -1)
-                                        a_id = str(s.get("areaId", ""))
+                            if status != "A":
+                                ast["raw_booked"] += 1
 
-                                        if a_id not in area_stats:
-                                            first_a_id = (
-                                                list(area_stats.keys())[0]
-                                                if area_stats
-                                                else "UNKNOWN"
-                                            )
-                                            if first_a_id not in area_stats:
-                                                area_stats[first_a_id] = {
-                                                    "cache_cap": 0,
-                                                    "cache_avail": 0,
-                                                    "price": 0.0,
-                                                    "phys_total": 0,
-                                                    "raw_booked": 0,
-                                                    "explicit_blocks": 0,
-                                                    "front_row_blocks": 0,
-                                                    "explicit_in_front_row": 0,
-                                                    "dead_room_blocks": 0,
-                                                }
-                                            a_id = first_a_id
+                                is_explicit = status != "R"
+                                is_front_row = row_num == 1 or (
+                                    row_num == -1
+                                    and str(s_id).upper().startswith("A")
+                                )
 
-                                        ast = area_stats[a_id]
-                                        ast["phys_total"] += 1
-
-                                        if status != "A":
-                                            ast["raw_booked"] += 1
-
-                                            is_explicit = status != "R"
-                                            is_front_row = row_num == 1 or (
-                                                row_num == -1
-                                                and str(s_id).upper().startswith("A")
-                                            )
-
-                                            if is_explicit:
-                                                ast["explicit_blocks"] += 1
-                                            if (
-                                                is_front_row
-                                                and occupancy < OCC_THRESHOLD_FRONTROW
-                                            ):
-                                                ast["front_row_blocks"] += 1
-                                            if (
-                                                is_explicit
-                                                and is_front_row
-                                                and occupancy < OCC_THRESHOLD_FRONTROW
-                                            ):
-                                                ast["explicit_in_front_row"] += 1
-                                            if s_id in dead_room_seats:
-                                                ast["dead_room_blocks"] += 1
-
-                                real_t_id = vt["data"].get("theaterId", t_id)
-                                screen_id = f"{real_t_id}_{aud_id}"
-
-                                force_cached = screen_id in PREFER_CACHED_SCREENS
-                                force_physical = screen_id in PREFER_PHYSICAL_SCREENS
-
-                                vt_true_cap = 0
-                                vt_true_booked = 0
-                                vt_gross = 0.0
-                                vt_max_gross = 0.0
-                                vt_phys_total = 0
-                                vt_raw_booked = 0
-                                seats_to_remove = 0
-
+                                if is_explicit:
+                                    ast["explicit_blocks"] += 1
                                 if (
-                                    SEAT_COUNT_MODE == 1
-                                    and vt_seats
-                                    and not force_cached
-                                ) or force_physical:
-                                    for a_id, ast in area_stats.items():
-                                        a_cache_cap = ast["cache_cap"]
-                                        a_price = ast["price"]
-
-                                        a_phantom_math = (
-                                            max(0, ast["phys_total"] - a_cache_cap)
-                                            if a_cache_cap > 0
-                                            else 0
-                                        )
-                                        a_visual_blocks = (
-                                            ast["explicit_blocks"]
-                                            + ast["front_row_blocks"]
-                                        ) - ast["explicit_in_front_row"]
-                                        a_seats_to_remove = max(
-                                            a_phantom_math,
-                                            a_visual_blocks,
-                                            ast["dead_room_blocks"],
-                                        )
-
-                                        a_true_cap = a_cache_cap
-                                        a_true_booked = max(
-                                            0, ast["raw_booked"] - a_seats_to_remove
-                                        )
-
-                                        vt_phys_total += ast["phys_total"]
-                                        vt_raw_booked += ast["raw_booked"]
-                                        seats_to_remove += a_seats_to_remove
-
-                                        vt_true_cap += a_true_cap
-                                        vt_true_booked += a_true_booked
-                                        vt_gross += a_true_booked * a_price
-                                        vt_max_gross += a_true_cap * a_price
-                                        if a_price > 0:
-                                            prices_seen.add(a_price)
-                                else:
-                                    for a_id, ast in area_stats.items():
-                                        a_cache_cap = ast["cache_cap"]
-                                        a_price = ast["price"]
-
-                                        a_true_cap = a_cache_cap
-                                        a_true_booked = max(
-                                            0, a_cache_cap - ast["cache_avail"]
-                                        )
-
-                                        vt_true_cap += a_true_cap
-                                        vt_true_booked += a_true_booked
-                                        vt_gross += a_true_booked * a_price
-                                        vt_max_gross += a_true_cap * a_price
-                                        if a_price > 0:
-                                            prices_seen.add(a_price)
-
-                                if (
-                                    vt["tier_info"].get("status", "").lower()
-                                    == "soldout"
+                                    is_front_row
+                                    and occupancy < OCC_THRESHOLD_FRONTROW
                                 ):
-                                    vt_true_cap = 0
-                                    vt_true_booked = 0
-                                    vt_gross = 0.0
-                                    vt_max_gross = 0.0
-                                    for a_id, ast in area_stats.items():
-                                        vt_true_cap += ast["cache_cap"]
-                                        vt_true_booked += ast["cache_cap"]
-                                        vt_gross += ast["cache_cap"] * ast["price"]
-                                        vt_max_gross += ast["cache_cap"] * ast["price"]
+                                    ast["front_row_blocks"] += 1
+                                if (
+                                    is_explicit
+                                    and is_front_row
+                                    and occupancy < OCC_THRESHOLD_FRONTROW
+                                ):
+                                    ast["explicit_in_front_row"] += 1
+                                if s_id in dead_room_seats:
+                                    ast["dead_room_blocks"] += 1
 
-                                vt["true_capacity"] = vt_true_cap
-                                vt["true_booked"] = vt_true_booked
+                    real_t_id = vt["data"].get("theaterId", t_id)
+                    screen_id = f"{real_t_id}_{aud_id}"
 
-                                allocated_cap += vt_true_cap
-                                allocated_booked += vt_true_booked
-                                allocated_gross += vt_gross
+                    force_cached = screen_id in PREFER_CACHED_SCREENS
+                    force_physical = screen_id in PREFER_PHYSICAL_SCREENS
 
-                                tier_hash = vt["tier_info"].get("hash")
-                                if tier_hash and vt_true_cap > 0:
-                                    learned_entry = {
-                                        "capacity": vt_true_cap,
-                                        "max_gross": vt_max_gross,
-                                        "format": vt["tier_info"].get(
-                                            "format", "Standard"
-                                        ),
-                                    }
-                                    local_hash_cache[tier_hash] = learned_entry
-                                    combined_cache_lookup[tier_hash] = learned_entry
+                    vt_true_cap = 0
+                    vt_true_booked = 0
+                    vt_gross = 0.0
+                    vt_max_gross = 0.0
+                    vt_phys_total = 0
+                    vt_raw_booked = 0
+                    seats_to_remove = 0
 
-                            all_tiers_info = [
-                                vt["tier_info"] for vt in cluster["tiers"]
-                            ] + cluster["failed_tiers"]
-                            is_any_available = any(
-                                t.get("status", "").lower() != "soldout"
-                                for t in all_tiers_info
+                    if (
+                        SEAT_COUNT_MODE == 1 and vt_seats and not force_cached
+                    ) or force_physical:
+                        for a_id, ast in area_stats.items():
+                            a_cache_cap = ast["cache_cap"]
+                            a_price = ast["price"]
+
+                            a_phantom_math = (
+                                max(0, ast["phys_total"] - a_cache_cap)
+                                if a_cache_cap > 0
+                                else 0
                             )
-                            has_failed_tiers = len(cluster["failed_tiers"]) > 0
-                            has_available_failed_tiers = any(
-                                ft.get("status", "").lower() != "soldout"
-                                for ft in cluster["failed_tiers"]
+                            a_visual_blocks = (
+                                ast["explicit_blocks"] + ast["front_row_blocks"]
+                            ) - ast["explicit_in_front_row"]
+                            a_seats_to_remove = max(
+                                a_phantom_math,
+                                a_visual_blocks,
+                                ast["dead_room_blocks"],
                             )
 
-                            base_aud_id = base_vt["data"].get("auditoriumId", "Unknown")
-                            real_base_t_id = base_vt["data"].get("theaterId", t_id)
-                            base_screen_id = f"{real_base_t_id}_{base_aud_id}"
-                            is_forced_cached = base_screen_id in PREFER_CACHED_SCREENS
+                            a_true_cap = a_cache_cap
+                            a_true_booked = max(
+                                0, ast["raw_booked"] - a_seats_to_remove
+                            )
 
-                            if (
-                                not is_multi_tier
-                                and SEAT_COUNT_MODE == 1
-                                and base_seats
-                                and base_has_valid_area
-                                and not is_forced_cached
-                            ):
-                                combined_total = allocated_cap
-                                combined_booked = allocated_booked
-                                combined_gross = allocated_gross
-                                calc_method_log = "Physical Catch-All"
+                            vt_phys_total += ast["phys_total"]
+                            vt_raw_booked += ast["raw_booked"]
+                            seats_to_remove += a_seats_to_remove
+
+                            vt_true_cap += a_true_cap
+                            vt_true_booked += a_true_booked
+                            vt_gross += a_true_booked * a_price
+                            vt_max_gross += a_true_cap * a_price
+                            if a_price > 0:
+                                prices_seen.add(a_price)
+                    else:
+                        for a_id, ast in area_stats.items():
+                            a_cache_cap = ast["cache_cap"]
+                            a_price = ast["price"]
+
+                            a_true_cap = a_cache_cap
+                            a_true_booked = max(
+                                0, a_cache_cap - ast["cache_avail"]
+                            )
+
+                            vt_true_cap += a_true_cap
+                            vt_true_booked += a_true_booked
+                            vt_gross += a_true_booked * a_price
+                            vt_max_gross += a_true_cap * a_price
+                            if a_price > 0:
+                                prices_seen.add(a_price)
+
+                    if vt["tier_info"].get("status", "").lower() == "soldout":
+                        vt_true_cap = 0
+                        vt_true_booked = 0
+                        vt_gross = 0.0
+                        vt_max_gross = 0.0
+                        for a_id, ast in area_stats.items():
+                            vt_true_cap += ast["cache_cap"]
+                            vt_true_booked += ast["cache_cap"]
+                            vt_gross += ast["cache_cap"] * ast["price"]
+                            vt_max_gross += ast["cache_cap"] * ast["price"]
+
+                    vt["true_capacity"] = vt_true_cap
+                    vt["true_booked"] = vt_true_booked
+
+                    allocated_cap += vt_true_cap
+                    allocated_booked += vt_true_booked
+                    allocated_gross += vt_gross
+
+                    tier_hash = vt["tier_info"].get("hash")
+                    if tier_hash and vt_true_cap > 0:
+                        learned_entry = {
+                            "capacity": vt_true_cap,
+                            "max_gross": vt_max_gross,
+                            "format": vt["tier_info"].get("format", "Standard"),
+                        }
+                        local_hash_cache[tier_hash] = learned_entry
+                        combined_cache_lookup[tier_hash] = learned_entry
+
+                all_tiers_info = [
+                    vt["tier_info"] for vt in cluster["tiers"]
+                ] + cluster["failed_tiers"]
+                is_any_available = any(
+                    t.get("status", "").lower() != "soldout" for t in all_tiers_info
+                )
+                has_failed_tiers = len(cluster["failed_tiers"]) > 0
+                has_available_failed_tiers = any(
+                    ft.get("status", "").lower() != "soldout"
+                    for ft in cluster["failed_tiers"]
+                )
+
+                base_aud_id = base_vt["data"].get("auditoriumId", "Unknown")
+                real_base_t_id = base_vt["data"].get("theaterId", t_id)
+                base_screen_id = f"{real_base_t_id}_{base_aud_id}"
+                is_forced_cached = base_screen_id in PREFER_CACHED_SCREENS
+
+                if (
+                    not is_multi_tier
+                    and SEAT_COUNT_MODE == 1
+                    and base_seats
+                    and base_has_valid_area
+                    and not is_forced_cached
+                ):
+                    combined_total = allocated_cap
+                    combined_booked = allocated_booked
+                    combined_gross = allocated_gross
+                    calc_method_log = "Physical Catch-All"
+                else:
+                    if not has_failed_tiers:
+                        combined_total = allocated_cap
+                        combined_booked = allocated_booked
+                        combined_gross = allocated_gross
+                        calc_method_log = "Per-Tier Phantom Sync"
+                    else:
+                        missing_capacity = max(
+                            0, base_phys_total_dots - allocated_cap
+                        )
+                        combined_total = allocated_cap
+                        combined_booked = allocated_booked
+                        combined_gross = allocated_gross
+
+                        for ft in cluster["failed_tiers"]:
+                            tier_hash = ft.get("hash")
+                            is_soldout = (
+                                ft.get("status", "").lower() == "soldout"
+                            )
+
+                            if tier_hash in combined_cache_lookup:
+                                c_cap = combined_cache_lookup[tier_hash]["capacity"]
+                                c_gross = combined_cache_lookup[tier_hash][
+                                    "max_gross"
+                                ]
+                                if c_gross == 0 and c_cap > 0:
+                                    c_gross = c_cap * MAX_TIER_PRICE
+
+                                combined_total += c_cap
+                                if is_soldout:
+                                    combined_booked += c_cap
+                                    combined_gross += c_gross
+                                    if c_cap > 0:
+                                        prices_seen.add(c_gross / c_cap)
+
+                                missing_capacity = max(0, missing_capacity - c_cap)
+                                calc_method_log = "Matrix: Hash Healed"
+                                healed_tiers_info.append(
+                                    f"[{ft['format']}] {c_cap} seats | ${c_gross:,.2f}"
+                                )
                             else:
-                                if not has_failed_tiers:
-                                    combined_total = allocated_cap
-                                    combined_booked = allocated_booked
-                                    combined_gross = allocated_gross
-                                    calc_method_log = "Per-Tier Phantom Sync"
-                                else:
-                                    missing_capacity = max(
-                                        0, base_phys_total_dots - allocated_cap
+                                combined_total += missing_capacity
+                                if is_soldout:
+                                    missing_booked = missing_capacity
+                                    combined_booked += missing_booked
+                                    price_to_use = (
+                                        safe_avg_price
+                                        if not is_any_available
+                                        else MAX_TIER_PRICE
                                     )
-                                    combined_total = allocated_cap
-                                    combined_booked = allocated_booked
-                                    combined_gross = allocated_gross
+                                    combined_gross += missing_booked * price_to_use
+                                    if price_to_use > 0:
+                                        prices_seen.add(price_to_use)
 
-                                    for ft in cluster["failed_tiers"]:
-                                        tier_hash = ft.get("hash")
-                                        is_soldout = (
-                                            ft.get("status", "").lower() == "soldout"
-                                        )
+                                missing_capacity = 0
+                                calc_method_log = "Matrix: Math Fallback"
 
-                                        if tier_hash in combined_cache_lookup:
-                                            c_cap = combined_cache_lookup[tier_hash][
-                                                "capacity"
-                                            ]
-                                            c_gross = combined_cache_lookup[tier_hash][
-                                                "max_gross"
-                                            ]
-                                            if c_gross == 0 and c_cap > 0:
-                                                c_gross = c_cap * MAX_TIER_PRICE
+                if combined_total > 0:
+                    kb_key = f"{t_id}_{final_format}"
+                    if kb_key not in local_knowledge_base:
+                        local_knowledge_base[kb_key] = {
+                            "total_seats_sum": 0,
+                            "count": 0,
+                            "prices": set(),
+                        }
+                    local_knowledge_base[kb_key]["total_seats_sum"] += combined_total
+                    local_knowledge_base[kb_key]["count"] += 1
+                    for p in prices_seen:
+                        if p > 0:
+                            local_knowledge_base[kb_key]["prices"].add(p)
 
-                                            combined_total += c_cap
-                                            if is_soldout:
-                                                combined_booked += c_cap
-                                                combined_gross += c_gross
-                                                if c_cap > 0:
-                                                    prices_seen.add(c_gross / c_cap)
+                final_status = _get_show_status(
+                    combined_booked,
+                    combined_total,
+                    has_available_failed_tiers,
+                )
+                price_str = (
+                    " / ".join(sorted([f"${p:.2f}" for p in prices_seen]))
+                    if prices_seen
+                    else "$0.00"
+                )
 
-                                            missing_capacity = max(
-                                                0, missing_capacity - c_cap
-                                            )
-                                            calc_method_log = "Matrix: Hash Healed"
-                                            healed_tiers_info.append(
-                                                f"[{ft['format']}] {c_cap} seats | ${c_gross:,.2f}"
-                                            )
-                                        else:
-                                            combined_total += missing_capacity
-                                            if is_soldout:
-                                                missing_booked = missing_capacity
-                                                combined_booked += missing_booked
-                                                price_to_use = (
-                                                    safe_avg_price
-                                                    if not is_any_available
-                                                    else MAX_TIER_PRICE
-                                                )
-                                                combined_gross += (
-                                                    missing_booked * price_to_use
-                                                )
-                                                if price_to_use > 0:
-                                                    prices_seen.add(price_to_use)
+                detailed_logger.info(
+                    f"{uid_log} SHOW KPI -> Method: {calc_method_log} | Status: {final_status} | "
+                    f"Booked: {combined_booked}/{combined_total} | Price: {price_str} | Gross: ${combined_gross:,.2f}"
+                )
 
-                                            missing_capacity = 0
-                                            calc_method_log = "Matrix: Math Fallback"
-
-                            if combined_total > 0:
-                                kb_key = f"{t_id}_{final_format}"
-                                if kb_key not in local_knowledge_base:
-                                    local_knowledge_base[kb_key] = {
-                                        "total_seats_sum": 0,
-                                        "count": 0,
-                                        "prices": set(),
-                                    }
-                                local_knowledge_base[kb_key][
-                                    "total_seats_sum"
-                                ] += combined_total
-                                local_knowledge_base[kb_key]["count"] += 1
-                                for p in prices_seen:
-                                    if p > 0:
-                                        local_knowledge_base[kb_key]["prices"].add(p)
-
-                            final_status = _get_show_status(
-                                combined_booked,
-                                combined_total,
-                                has_available_failed_tiers,
-                            )
-                            price_str = (
-                                " / ".join(sorted([f"${p:.2f}" for p in prices_seen]))
-                                if prices_seen
-                                else "$0.00"
-                            )
-
-                            if "Hash Healed" in calc_method_log:
-                                if "Matrix" in calc_method_log and healed_tiers_info:
-                                    partial_details = " + ".join(healed_tiers_info)
-                                    local_hash_healed_log.append(
-                                        f"( {target_state} ) {t_name} - {show_time} - PARTIAL HEAL: "
-                                        f"{partial_details} (Merged into live room)"
-                                    )
-                                else:
-                                    local_hash_healed_log.append(
-                                        f"( {target_state} ) {t_name} - {show_time} [{final_format}] "
-                                        f"- Healed {combined_total} seats | ${combined_gross:,.2f}"
-                                    )
-
-                            local_shows_data.append(
-                                {
-                                    "state": target_state,
-                                    "t_id": t_id,
-                                    "theater": t_name,
-                                    "format": final_format,
-                                    "language": final_language,
-                                    "time": show_time,
-                                    "status": final_status,
-                                    "format_categories": combine_report_format_categories(
-                                        [
-                                            vt["tier_info"]
-                                            for vt in cluster["tiers"]
-                                        ]
-                                        + cluster["failed_tiers"]
-                                    ),
-                                    "price_str": price_str,
-                                    "total": combined_total,
-                                    "booked": combined_booked,
-                                    "gross": combined_gross,
-                                    "seat_map_urls": matrix_urls_str,
-                                }
-                            )
-
-                            local_summary_data[t_id]["shows"] += 1
-                            local_summary_data[t_id]["total"] += combined_total
-                            local_summary_data[t_id]["booked"] += combined_booked
-                            local_summary_data[t_id]["gross"] += combined_gross
-
-                    except Exception as e:
-                        detailed_logger.error(
-                            f"[Thread-{worker_id}] EXCEPTION processing cluster at {show_time}: {e}"
+                if "Hash Healed" in calc_method_log:
+                    t_healed_cnt += 1
+                    if "Matrix" in calc_method_log and healed_tiers_info:
+                        partial_details = " + ".join(healed_tiers_info)
+                        local_hash_healed_log.append(
+                            f"( {target_state} ) {t_name} - {show_time} - PARTIAL HEAL: "
+                            f"{partial_details} (Merged into live room)"
+                        )
+                    else:
+                        local_hash_healed_log.append(
+                            f"( {target_state} ) {t_name} - {show_time} [{final_format}] "
+                            f"- Healed {combined_total} seats | ${combined_gross:,.2f}"
                         )
 
-        print(f"[Thread-{worker_id}] 🛑 Queue Empty. Closing browser.")
-        await browser.close()
+                local_shows_data.append(
+                    {
+                        "state": target_state,
+                        "t_id": t_id,
+                        "theater": t_name,
+                        "format": final_format,
+                        "language": final_language,
+                        "time": show_time,
+                        "status": final_status,
+                        "format_categories": combine_report_format_categories(
+                            [vt["tier_info"] for vt in cluster["tiers"]]
+                            + cluster["failed_tiers"]
+                        ),
+                        "price_str": price_str,
+                        "total": combined_total,
+                        "booked": combined_booked,
+                        "gross": combined_gross,
+                        "seat_map_urls": matrix_urls_str,
+                    }
+                )
 
-    return {
-        "shows_data": local_shows_data,
-        "summary_data": local_summary_data,
-        "knowledge_base": local_knowledge_base,
-        "sold_out_queue": local_sold_out_queue,
-        "ignored_log": local_ignored_shows_log,
-        "hash_cache": local_hash_cache,
-        "hash_healed_log": local_hash_healed_log,
-    }
+                local_summary_data[t_id]["shows"] += 1
+                local_summary_data[t_id]["total"] += combined_total
+                local_summary_data[t_id]["booked"] += combined_booked
+                local_summary_data[t_id]["gross"] += combined_gross
+
+                t_shows_cnt += 1
+                if final_status == "Sold Out":
+                    t_soldout_cnt += 1
+                t_cap_sum += combined_total
+                t_booked_sum += combined_booked
+                t_gross_sum += combined_gross
+
+        except Exception as e:
+            detailed_logger.error(
+                f"EXCEPTION processing cluster at {t_name} ({show_time}): {e}"
+            )
+
+    t_occ = (t_booked_sum / t_cap_sum * 100.0) if t_cap_sum > 0 else 0.0
+    detailed_logger.info(
+        f"=== THEATER SUMMARY: [{target_state}] {t_name} ({t_id}) -> "
+        f"Shows: {t_shows_cnt} | Booked: {t_booked_sum:,}/{t_cap_sum:,} ({t_occ:.2f}%) | Gross: ${t_gross_sum:,.2f} ==="
+    )
+    return t_shows_cnt, t_soldout_cnt, t_cap_sum, t_booked_sum, t_gross_sum, t_healed_cnt
 
 
-async def run_all_workers_async(
-    tasks_list, total_tasks, detailed_logger, master_hash_cache, rate_limit_events
+async def run_two_phase_pipeline_async(
+    tasks_list, total_tasks, detailed_logger, master_hash_cache
 ):
-    async_queue = asyncio.Queue()
-    for item in tasks_list:
-        async_queue.put_nowait(item)
+    dashboard = LiveTerminalDashboard(total_theaters=total_tasks)
 
-    worker_coros = [
-        process_theaters_worker_async(
-            async_queue,
-            i + 1,
-            total_tasks,
-            detailed_logger,
-            master_hash_cache,
-            rate_limit_events,
+    phase1_queue = asyncio.Queue()
+    for item in tasks_list:
+        phase1_queue.put_nowait(item)
+
+    discovered_active_theaters = []
+    phase2_queue = asyncio.Queue()
+
+    async with async_playwright() as p:
+        print(f"🌐 Launching {MAX_WORKERS} isolated Chromium processes & establishing full Akamai trust...")
+        browsers = []
+        contexts = []
+        pages = []
+
+        async def _init_one_browser(w_idx: int):
+            # Stagger browser startups by 0.45s each so all 8 don't hit Akamai's sensor endpoint at the same millisecond
+            await asyncio.sleep((w_idx - 1) * 0.45)
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                ],
+            )
+            context = await browser.new_context(viewport={"width": 1280, "height": 800})
+            page = await context.new_page()
+            await refresh_akamai_trust(
+                context, page, w_idx, detailed_logger, reset_cookies=False
+            )
+            return browser, context, page
+
+        init_results = await asyncio.gather(
+            *[_init_one_browser(i + 1) for i in range(MAX_WORKERS)]
         )
-        for i in range(MAX_WORKERS)
-    ]
-    return await asyncio.gather(*worker_coros, return_exceptions=True)
+        for b, ctx, pg in init_results:
+            browsers.append(b)
+            contexts.append(ctx)
+            pages.append(pg)
+
+        # --------------------------------------------------------------------
+        # PHASE 1: GLOBAL THEATER DISCOVERY (SEQUENTIAL IN-BATCH + V8 FILTER)
+        # --------------------------------------------------------------------
+        dashboard.start_phase1()
+        worker_req_counts = [0] * MAX_WORKERS
+        master_rate_limit_shows = []
+
+        async def _phase1_worker(w_idx: int):
+            context = contexts[w_idx]
+            page = pages[w_idx]
+            rotate_limit = PROACTIVE_ROTATE_LIMIT + (w_idx * 20)
+
+            while not phase1_queue.empty():
+                if worker_req_counts[w_idx] >= rotate_limit:
+                    await refresh_akamai_trust(
+                        context, page, w_idx + 1, detailed_logger, reset_cookies=True
+                    )
+                    worker_req_counts[w_idx] = 0
+
+                batch_items = []
+                for _ in range(THEATER_BATCH_SIZE):
+                    try:
+                        item = phase1_queue.get_nowait()
+                        if item[2].get("theaterId"):
+                            batch_items.append(item)
+                    except asyncio.QueueEmpty:
+                        break
+
+                if not batch_items:
+                    break
+
+                batch_results, retries_cnt = await fetch_theaters_batch_js(
+                    context, page, batch_items, w_idx + 1, detailed_logger
+                )
+                worker_req_counts[w_idx] += len(batch_items)
+
+                active_found_in_batch = 0
+                shows_found_in_batch = 0
+
+                for res_obj in batch_results or []:
+                    b_idx = res_obj.get("idx", 0)
+                    task_idx, target_state, t = batch_items[b_idx]
+                    t_name = t.get("theaterName", "Unknown")
+                    t_id = t.get("theaterId")
+                    if not t_id:
+                        continue
+
+                    err_code = res_obj.get("error")
+                    if err_code is not None:
+                        if err_code in (403, 429):
+                            log_rate_limit_incident(
+                                detailed_logger,
+                                master_rate_limit_shows,
+                                f"Master List HTTP {err_code} after {MAX_API_RETRIES} "
+                                f"attempts: {t_name} ({t_id})",
+                            )
+                        detailed_logger.error(
+                            f"[Worker-{w_idx+1}] ⚠️ FAILED TO FETCH THEATER MASTER LIST. Status: {err_code} for {t_name}"
+                        )
+                        continue
+
+                    if not res_obj.get("hasMovie"):
+                        continue
+
+                    grouped_shows = extract_grouped_shows_from_matched_movies(
+                        res_obj.get("movies", []), t_id, t_name, target_state
+                    )
+                    if grouped_shows:
+                        active_found_in_batch += 1
+                        shows_found_in_batch += len(grouped_shows)
+                        discovered_active_theaters.append(
+                            (t_id, t_name, target_state, grouped_shows)
+                        )
+
+                dashboard.update_phase1(
+                    scanned_delta=len(batch_items),
+                    active_delta=active_found_in_batch,
+                    shows_delta=shows_found_in_batch,
+                    retries_delta=retries_cnt,
+                )
+
+        await asyncio.gather(*[_phase1_worker(i) for i in range(MAX_WORKERS)])
+        dashboard.finish_phase1()
+
+        # Refresh all 8 worker cookies cleanly before starting Phase 2 seatMaps
+        print("🔄 Refreshing Akamai sessions before Phase 2 seat-map scraping...")
+        await asyncio.gather(
+            *[
+                refresh_akamai_trust(
+                    contexts[i], pages[i], i + 1, detailed_logger, reset_cookies=True
+                )
+                for i in range(MAX_WORKERS)
+            ]
+        )
+        worker_req_counts = [0] * MAX_WORKERS
+
+        # --------------------------------------------------------------------
+        # PHASE 2: SORT ACTIVE THEATERS LARGEST-FIRST & SCRAPE SEAT MAPS
+        # --------------------------------------------------------------------
+        discovered_active_theaters.sort(key=lambda item: len(item[3]), reverse=True)
+        total_shows_discovered = sum(len(item[3]) for item in discovered_active_theaters)
+
+        for item in discovered_active_theaters:
+            phase2_queue.put_nowait(item)
+
+        dashboard.start_phase2(
+            total_shows_to_scrape=total_shows_discovered,
+            total_active_theaters=len(discovered_active_theaters),
+        )
+
+        async def _phase2_worker(w_idx: int):
+            context = contexts[w_idx]
+            page = pages[w_idx]
+            rotate_limit = PROACTIVE_ROTATE_LIMIT + (w_idx * 20)
+
+            local_shows_data = []
+            local_summary_data = {}
+            local_knowledge_base = {}
+            local_sold_out_queue = []
+            local_ignored_shows_log = []
+            local_hash_cache = {}
+            local_hash_healed_log = []
+            local_rate_limit_shows = []
+
+            combined_cache_lookup = {**master_hash_cache}
+
+            while not phase2_queue.empty():
+                try:
+                    t_id, t_name, target_state, grouped_shows = phase2_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+                hashes_to_fetch = []
+                for group_key, show_info in grouped_shows.items():
+                    for tier in show_info["tiers"]:
+                        t_hash = tier["hash"]
+                        if (
+                            str(tier.get("status", "")).lower() == "soldout"
+                            and t_hash in combined_cache_lookup
+                        ):
+                            continue
+                        hashes_to_fetch.append(t_hash)
+
+                if worker_req_counts[w_idx] + len(hashes_to_fetch) >= rotate_limit:
+                    await refresh_akamai_trust(
+                        context, page, w_idx + 1, detailed_logger, reset_cookies=True
+                    )
+                    worker_req_counts[w_idx] = 0
+
+                seat_map_results, retries_cnt = await fetch_seatmaps_for_theater_js(
+                    context, page, hashes_to_fetch, w_idx + 1, detailed_logger
+                )
+                worker_req_counts[w_idx] += len(hashes_to_fetch)
+
+                (
+                    t_shows_cnt,
+                    t_soldout_cnt,
+                    t_cap_sum,
+                    t_booked_sum,
+                    t_gross_sum,
+                    t_healed_cnt,
+                ) = evaluate_theater_shows_math(
+                    t_id=t_id,
+                    t_name=t_name,
+                    target_state=target_state,
+                    grouped_shows=grouped_shows,
+                    seat_map_results=seat_map_results,
+                    combined_cache_lookup=combined_cache_lookup,
+                    local_hash_cache=local_hash_cache,
+                    local_shows_data=local_shows_data,
+                    local_summary_data=local_summary_data,
+                    local_knowledge_base=local_knowledge_base,
+                    local_sold_out_queue=local_sold_out_queue,
+                    local_ignored_shows_log=local_ignored_shows_log,
+                    local_hash_healed_log=local_hash_healed_log,
+                    local_rate_limit_shows=local_rate_limit_shows,
+                    detailed_logger=detailed_logger,
+                )
+
+                dashboard.update_phase2_theater(
+                    state=target_state,
+                    t_name=t_name,
+                    shows_cnt=t_shows_cnt,
+                    sold_out_cnt=t_soldout_cnt,
+                    cap_sum=t_cap_sum,
+                    booked_sum=t_booked_sum,
+                    gross_sum=t_gross_sum,
+                    healed_cnt=t_healed_cnt,
+                    retries_cnt=retries_cnt,
+                )
+
+            return {
+                "shows_data": local_shows_data,
+                "summary_data": local_summary_data,
+                "knowledge_base": local_knowledge_base,
+                "sold_out_queue": local_sold_out_queue,
+                "ignored_log": local_ignored_shows_log,
+                "hash_cache": local_hash_cache,
+                "hash_healed_log": local_hash_healed_log,
+                "rate_limit_shows": local_rate_limit_shows,
+            }
+
+        worker_results = await asyncio.gather(
+            *[_phase2_worker(i) for i in range(MAX_WORKERS)], return_exceptions=True
+        )
+        dashboard.finish_phase2()
+
+        for b in browsers:
+            try:
+                await b.close()
+            except Exception:
+                pass
+
+    return worker_results, master_rate_limit_shows
+
+
+def log_rate_limit_incident(detailed_logger, incidents, incident):
+    if incident in incidents:
+        return
+    incidents.append(incident)
+    detailed_logger.warning("RATE LIMITED: %s", incident)
+    for handler in detailed_logger.handlers:
+        handler.flush()
+    tqdm.write(f"RATE LIMITED: {incident}")
+
+
+def log_rate_limit_summary(detailed_logger, incidents):
+    unique_incidents = list(dict.fromkeys(incidents))
+    summary = (
+        f"RATE LIMIT SUMMARY: {len(unique_incidents)} request(s) still returned "
+        "HTTP 403/429 after all retries."
+    )
+    print(summary, flush=True)
+    detailed_logger.warning(summary)
+    for incident in unique_incidents:
+        print(f"RATE LIMITED: {incident}", flush=True)
+        detailed_logger.warning(incident)
+    for handler in detailed_logger.handlers:
+        handler.flush()
 
 
 # =============================================================================
@@ -2345,7 +2597,6 @@ async def run_all_workers_async(
 if __name__ == "__main__":
     PIPELINE_START_TIME = time.time()
 
-    # ✨ SETUP STEALTH FILE LOGGER (No Terminal Output)
     os.makedirs("logs", exist_ok=True)
     log_timestamp = time.strftime("%Y%m%d_%H%M%S")
     log_filename = f"logs/detailed_logs_{log_timestamp}.log"
@@ -2359,11 +2610,13 @@ if __name__ == "__main__":
 
     ids_display = ", ".join(TARGET_MOVIE_IDS)
     detailed_logger.info(
-        f"🚀 MULTI-BROWSER PIPELINE STARTED: {SHOW_DATE} | Movie: {MOVIE_TITLE} ({ids_display}) | Workers: {MAX_WORKERS}"
+        f"🚀 PIPELINE STARTED: {SHOW_DATE} | Movie: {MOVIE_TITLE} (IDs: {ids_display}) | Workers: {MAX_WORKERS}"
     )
-    print(
-        f"🚀 HIGH-SPEED PIPELINE STARTED | Movie: {MOVIE_TITLE} ({ids_display}) | Date: {SHOW_DATE} | Workers: {MAX_WORKERS}"
-    )
+    print("================================================================================")
+    print(f"🎬 FANDANGO US BOX OFFICE TRACKER | {MOVIE_TITLE.upper()} | Date: {SHOW_DATE}")
+    print(f"🎯 Target Movie ID(s): {ids_display} | Default Lang: {DEFAULT_LANGUAGE} | Workers: {MAX_WORKERS}")
+    print(f"📝 Detailed Theater & Show Logs -> {log_filename}")
+    print("================================================================================")
 
     if not os.path.exists(MAPPING_FILE):
         print(
@@ -2378,7 +2631,7 @@ if __name__ == "__main__":
         print(f"❌ Error: {MAPPING_FILE} is corrupted or invalid JSON. ({e})")
         exit()
 
-    # 1. FLATTEN TASK LIST (Theater-by-Theater Load Balancing)
+    # 1. FLATTEN TASK LIST
     tasks_list = []
     task_counter = 1
 
@@ -2390,7 +2643,7 @@ if __name__ == "__main__":
 
     total_tasks = len(tasks_list)
     print(
-        f"📦 Total Theaters to process: {total_tasks} across {len(TARGET_STATES)} States."
+        f"📦 Total Theaters to scan: {total_tasks:,} across {len(TARGET_STATES)} States."
     )
 
     # 2. MASTER DATA STORES
@@ -2507,21 +2760,19 @@ if __name__ == "__main__":
                     },
                 )
             daily_snapshot_observed_at = daily_baseline.get("observed_at")
-            print(f"📈 Loaded V2 daily baseline {daily_snapshot_id}.")
+            print(f"📈 Loaded V2 daily baseline {daily_snapshot_id}.\n")
         else:
-            print("ℹ️ No manually selected daily baseline exists yet.")
+            print("ℹ️ No manually selected daily baseline exists yet.\n")
 
-    # 3. EXECUTE HIGH-SPEED ASYNC MULTI-BROWSER POOL
+    # 3. EXECUTE TWO-PHASE LOAD-BALANCED PIPELINE WITH LIVE TERMINAL DASHBOARD
     try:
-        worker_results = asyncio.run(
-            run_all_workers_async(
-                tasks_list,
-                total_tasks,
-                detailed_logger,
-                master_hash_cache,
-                master_rate_limit_shows,
+        worker_results, p1_rate_limits = asyncio.run(
+            run_two_phase_pipeline_async(
+                tasks_list, total_tasks, detailed_logger, master_hash_cache
             )
         )
+        master_rate_limit_shows.extend(p1_rate_limits)
+
         for result in worker_results:
             if isinstance(result, Exception):
                 print(f"❌ A worker encountered an error: {result}")
@@ -2533,6 +2784,7 @@ if __name__ == "__main__":
             master_sold_out_queue.extend(result["sold_out_queue"])
             master_ignored_shows_log.extend(result["ignored_log"])
             master_hash_healed_log.extend(result.get("hash_healed_log", []))
+            master_rate_limit_shows.extend(result.get("rate_limit_shows", []))
 
             for t_id, data in result["summary_data"].items():
                 if t_id not in master_summary_data:
@@ -2898,7 +3150,7 @@ if __name__ == "__main__":
         )
 
     # =========================================================================
-    # ── 5. GENERATE REPORTS & SEND EMAIL ─────────────────────────────────────
+    # ── 5. GENERATE REPORTS, PRINT FINAL KPI SUMMARY & SEND EMAIL ────────────
     # =========================================================================
     if master_shows_data:
         print(f"\n🚀 Formatting data and building reports...")
@@ -2970,8 +3222,6 @@ if __name__ == "__main__":
         if master_hash_healed_log:
             print("\n=====================================================================")
             print("🟢 HASH CACHE HEALED SHOWS (100% Accurate Recovery)")
-            print("The following Sold Out shows crashed the Fandango API, but their exact")
-            print("physical seating capacities and prices were instantly restored using Firebase memory.")
             print("=====================================================================")
             for log in master_hash_healed_log:
                 print(log)
@@ -2980,9 +3230,6 @@ if __name__ == "__main__":
         if master_sold_out_queue:
             print("\n=====================================================================")
             print("⚠️ SOLD-OUT SHOWS WITHOUT DATA — MANUAL REVIEW REQUIRED")
-            print("These shows are sold out, but seat-map data was unavailable.")
-            print("Check their actual gross/tickets, then add verified values to MANUAL_SHOWS.")
-            print("They were not estimated or included in the report totals.")
             print("=====================================================================")
             for item in master_sold_out_queue:
                 print(
@@ -2995,9 +3242,7 @@ if __name__ == "__main__":
 
         if ignored_soldout_chain_log:
             print("\n=====================================================================")
-            print("🚫 IGNORED SOLD OUT SHOWS (Specific Chains)")
-            print(f"The following Sold Out shows belonged to: {', '.join(IGNORE_SOLDOUT_CHAINS)}")
-            print("Their Gross and Tickets have been reverted to 0.")
+            print(f"🚫 IGNORED SOLD OUT SHOWS ({', '.join(IGNORE_SOLDOUT_CHAINS)})")
             print("=====================================================================")
             for log in ignored_soldout_chain_log:
                 print(log)
@@ -3006,30 +3251,27 @@ if __name__ == "__main__":
         if master_ignored_shows_log:
             print("\n=====================================================================")
             print("⚠️ SHOWS WITH MAP ERRORS (0 Capacity Logged)")
-            print("The following shows are available but we were not able to fetch seats.")
-            print("They have been included in the reports to count the show, but with 0 seats/gross.")
             print("=====================================================================")
             for log in master_ignored_shows_log:
                 print(log)
             print("=====================================================================\n")
 
-        if master_rate_limit_shows:
-            print("\n=====================================================================")
-            print(
-                f"⚠️ RATE LIMIT WARNING: observed {len(master_rate_limit_shows)} "
-                "HTTP 403/429 responses."
-            )
-            print("=====================================================================\n")
+        final_theaters_cnt = len({r.get("t_id") for r in master_shows_data if not r.get("is_extra")})
+        final_shows_cnt = sum(1 for r in master_shows_data if not r.get("is_extra"))
+        final_soldout_cnt = sum(1 for r in master_shows_data if r.get("status") == "Sold Out")
+        final_cap = sum(int(r.get("total", 0)) for r in master_shows_data)
+        final_booked = sum(int(r.get("booked", 0)) for r in master_shows_data)
+        final_gross = sum(float(r.get("gross", 0.0)) for r in master_shows_data)
+        final_occ = (final_booked / final_cap * 100.0) if final_cap > 0 else 0.0
+        final_atp = (final_gross / final_booked) if final_booked > 0 else 0.0
 
         momentum_msg = ""
         if previous_shows_data:
             prev_gross = sum(r.get("gross", 0) for r in previous_shows_data)
             prev_tickets = sum(r.get("booked", 0) for r in previous_shows_data)
-            curr_gross = sum(r.get("gross", 0) for r in master_shows_data)
-            curr_tickets = sum(r.get("booked", 0) for r in master_shows_data)
 
-            diff_gross = curr_gross - prev_gross
-            diff_tickets = curr_tickets - prev_tickets
+            diff_gross = final_gross - prev_gross
+            diff_tickets = final_booked - prev_tickets
 
             sign_t = "+" if diff_tickets >= 0 else ""
             sign_g = "+" if diff_gross >= 0 else ""
@@ -3118,19 +3360,23 @@ if __name__ == "__main__":
                 logging.exception("Automatic USA/global portal refresh failed.")
                 raise
 
-        if momentum_msg:
-            manual_notes_text = (
-                (manual_notes_text or "") + "\n\n" + momentum_msg
-            ).strip()
-
         pipeline_elapsed = time.time() - PIPELINE_START_TIME
-        log_rate_limit_summary(detailed_logger, master_rate_limit_shows)
-        db.reference("fandango_cron_currentindex").set(FANDANGO_QUEUE_NEXT_INDEX)
-        print(f"✅ Queue cursor advanced to {FANDANGO_QUEUE_NEXT_INDEX}.")
         mins, secs = divmod(pipeline_elapsed, 60)
-        print(
-            f"🎉 Pipeline completely finished in {int(mins)} minutes and {int(secs)} seconds!"
-        )
+
+        print("\n================================================================================")
+        print(f"🏆 FINAL BOX OFFICE SUMMARY — {MOVIE_TITLE.upper()} ({SHOW_DATE})")
+        print("================================================================================")
+        print(f"  • Active Theaters : {final_theaters_cnt:,}")
+        print(f"  • Total Showtimes : {final_shows_cnt:,} (Sold Out: {final_soldout_cnt:,})")
+        print(f"  • Tickets Sold    : {final_booked:,} / {final_cap:,} ({final_occ:.2f}% Occupancy)")
+        print(f"  • Effective ATP   : ${final_atp:.2f}")
+        print(f"  • Total Gross ($) : ${final_gross:,.2f}")
+        if momentum_msg:
+            print(f"  • Momentum Delta  : {momentum_msg.splitlines()[1]}")
+        print(f"  • Total Runtime   : {int(mins)}m {secs:.1f}s")
+        print(f"  • Detailed Log    : {log_filename}")
+        print("================================================================================")
+
         detailed_logger.info("🎉 PIPELINE FINISHED SUCCESSFULLY.")
 
         if OVERRIDE_LOCAL_SNAPSHOT:
@@ -3147,8 +3393,14 @@ if __name__ == "__main__":
                 f"⏭️ Skipping snapshot save (OVERRIDE_LOCAL_SNAPSHOT is set to False)."
             )
 
+        db.reference("fandango_cron_currentindex").set(FANDANGO_QUEUE_NEXT_INDEX)
+        print(f"✅ Queue cursor advanced to {FANDANGO_QUEUE_NEXT_INDEX}.")
+        log_rate_limit_summary(detailed_logger, master_rate_limit_shows)
+
     else:
         print("❌ No successful showtime seat maps were fetched across any state.")
         log_rate_limit_summary(detailed_logger, master_rate_limit_shows)
         detailed_logger.info("❌ PIPELINE FAILED OR NO MAPS FETCHED.")
-        raise RuntimeError("Queue item was not advanced because no showtime seat maps were fetched.")
+        raise RuntimeError(
+            "Queue item was not advanced because no showtime seat maps were fetched."
+        )
