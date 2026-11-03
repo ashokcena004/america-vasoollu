@@ -273,6 +273,92 @@ TARGET_STATES = [
 # ── WORKER FUNCTION ──────────────────────────────────────────────────────────
 # =============================================================================
 
+def fetch_json_with_diagnostics(page, url):
+    return page.evaluate(
+        """async (url) => {
+            const startedAt = performance.now();
+            const diagnosticHeaders = [
+                "content-type",
+                "retry-after",
+                "server",
+                "via",
+                "x-cache",
+                "x-akamai-request-id",
+                "x-akamai-session-info"
+            ];
+            try {
+                const response = await fetch(url);
+                const body = await response.text();
+                const headers = {};
+                for (const name of diagnosticHeaders) {
+                    const value = response.headers.get(name);
+                    if (value !== null) headers[name] = value;
+                }
+                const result = {
+                    ok: response.ok,
+                    status: response.status,
+                    status_text: response.statusText,
+                    headers,
+                    duration_ms: Math.round(performance.now() - startedAt)
+                };
+                let data;
+                let parsed = false;
+                try {
+                    data = JSON.parse(body);
+                    parsed = true;
+                } catch (error) {
+                    result.parse_error = {
+                        name: error.name,
+                        message: error.message
+                    };
+                }
+                if (!response.ok) {
+                    result.error = "HTTP response was not successful";
+                    result.body_preview = body.slice(0, 2000);
+                    if (parsed) result.data = data;
+                    return result;
+                }
+                if (!parsed) {
+                    result.ok = false;
+                    result.error = "Invalid JSON response";
+                    result.body_preview = body.slice(0, 2000);
+                    return result;
+                }
+                result.data = data;
+                return result;
+            } catch (error) {
+                return {
+                    ok: false,
+                    duration_ms: Math.round(performance.now() - startedAt),
+                    error: {
+                        name: error.name,
+                        message: error.message
+                    }
+                };
+            }
+        }""",
+        url,
+    )
+
+
+def log_fandango_request_failure(request_type, context, diagnostic):
+    failure = {
+        "event": "fandango_request_failure",
+        "request_type": request_type,
+        **context,
+    }
+    if isinstance(diagnostic, dict):
+        failure.update(diagnostic)
+    else:
+        failure["error"] = f"Unexpected diagnostic response: {diagnostic!r}"
+    diagnostic_data = failure.pop("data", None)
+    if diagnostic_data is not None and "body_preview" not in failure:
+        failure["body_preview"] = json.dumps(
+            diagnostic_data, ensure_ascii=False, default=str
+        )[:2000]
+    logging.error("FANDANGO_REQUEST_FAILURE %s", json.dumps(failure, ensure_ascii=False))
+
+
 def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cache=None):
     if master_hash_cache is None: master_hash_cache = {}
     
@@ -312,17 +398,29 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
             api_url = f"https://www.fandango.com/napi/theaterMovieShowtimes/{t_id}?chainCode=&startDate={SHOW_DATE}&isdesktop=false"
             
             try:
-
-                raw_data = page.evaluate(f"""async () => {{
-                    try {{
-                        const response = await fetch('{api_url}');
-                        if (!response.ok) return null;
-                        return await response.json();
-                    }} catch(e) {{ return null; }}
-                }}""")
-
-                if not raw_data: 
-                    print(f"[Thread-{thread_id}] ⚠️ FAILED TO FETCH THEATER MASTER LIST (Akamai Block/Timeout) for {t_name}")
+                theater_response = fetch_json_with_diagnostics(page, api_url)
+                raw_data = (
+                    theater_response.get("data")
+                    if isinstance(theater_response, dict) and theater_response.get("ok")
+                    else None
+                )
+                if not isinstance(raw_data, dict):
+                    log_fandango_request_failure(
+                        "theater_showtimes",
+                        {
+                            "thread_id": thread_id,
+                            "state": target_state,
+                            "theater": t_name,
+                            "theater_id": t_id,
+                            "show_date": SHOW_DATE,
+                            "url": api_url,
+                        },
+                        theater_response,
+                    )
+                    print(
+                        f"[Thread-{thread_id}] ⚠️ Failed theater showtimes request "
+                        f"for {t_name}; see FANDANGO_REQUEST_FAILURE details above."
+                    )
                     continue
 
                 movies = raw_data.get('viewModel', {}).get('movies', [])
@@ -397,6 +495,24 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                             })
             
             except Exception as e:
+                log_fandango_request_failure(
+                    "theater_showtimes",
+                    {
+                        "thread_id": thread_id,
+                        "state": target_state,
+                        "theater": t_name,
+                        "theater_id": t_id,
+                        "show_date": SHOW_DATE,
+                        "url": api_url,
+                    },
+                    {
+                        "error": {
+                            "name": type(e).__name__,
+                            "message": str(e),
+                        },
+                        "traceback": traceback.format_exc(),
+                    },
+                )
                 print(f"[Thread-{thread_id}] EXCEPTION processing theater {t_name}: {e}")
                 continue
 
@@ -409,31 +525,78 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                     seat_api_url = f"https://www.fandango.com/napi/seatMap/{tier_hash}"
                     
                     try:
-                        seat_response = page.evaluate(f"""async () => {{
-                            try {{
-                                const response = await fetch('{seat_api_url}');
-                                const data = await response.json().catch(() => null);
-                                if (!response.ok) {{
-                                    if (Array.isArray(data) && data.length > 0 && data[0].id === 'PerformanceSoldOut') {{
-                                        return data;
-                                    }}
-                                    return {{ error: response.status }};
-                                }}
-                                return data;
-                            }} catch(e) {{ return {{ error: "Fetch Exception: " + e.message }}; }}
-                        }}""")
+                        seat_diagnostic = fetch_json_with_diagnostics(page, seat_api_url)
+                        seat_response = (
+                            seat_diagnostic.get("data")
+                            if isinstance(seat_diagnostic, dict) and seat_diagnostic.get("ok")
+                            else None
+                        )
                         
                         # ✨ FIX: Intercept explicit PerformanceSoldOut list responses
-                        if isinstance(seat_response, list) and len(seat_response) > 0 and seat_response[0].get("id") == "PerformanceSoldOut":
+                        is_performance_sold_out = (
+                            isinstance(seat_diagnostic, dict)
+                            and seat_diagnostic.get("status", 0) >= 400
+                            and isinstance(seat_diagnostic.get("data"), list)
+                            and len(seat_diagnostic["data"]) > 0
+                            and isinstance(seat_diagnostic["data"][0], dict)
+                            and seat_diagnostic["data"][0].get("id") == "PerformanceSoldOut"
+                        )
+                        if is_performance_sold_out:
                             tier['status'] = 'soldout' # <--- Removed the space here!
                             show_info['failed_tiers'].append(tier)
                         elif seat_response and isinstance(seat_response, dict) and "error" not in seat_response:
                             show_info['valid_tiers'].append({'data': seat_response.get('data', seat_response), 'tier_info': tier})
                         else:
                             show_info['failed_tiers'].append(tier)
+                            if isinstance(seat_diagnostic, dict) and seat_diagnostic.get("ok"):
+                                seat_diagnostic = {
+                                    **seat_diagnostic,
+                                    "ok": False,
+                                    "error": "Unexpected JSON payload shape for seat map",
+                                    "body_preview": json.dumps(
+                                        seat_response, ensure_ascii=False, default=str
+                                    )[:2000],
+                                }
+                            log_fandango_request_failure(
+                                "seat_map",
+                                {
+                                    "thread_id": thread_id,
+                                    "state": target_state,
+                                    "theater": t_name,
+                                    "theater_id": t_id,
+                                    "show_date": SHOW_DATE,
+                                    "show_time": show_info["time"],
+                                    "show_format": tier.get("format"),
+                                    "show_status": tier.get("status"),
+                                    "showtime_hash": tier_hash,
+                                    "url": seat_api_url,
+                                },
+                                seat_diagnostic,
+                            )
                     except Exception as seat_fetch_ex:
                         show_info['failed_tiers'].append(tier)
-                        print(f"[Thread-{thread_id}] EXCEPTION fetching seat map {tier_hash}: {seat_fetch_ex}")
+                        log_fandango_request_failure(
+                            "seat_map",
+                            {
+                                "thread_id": thread_id,
+                                "state": target_state,
+                                "theater": t_name,
+                                "theater_id": t_id,
+                                "show_date": SHOW_DATE,
+                                "show_time": show_info["time"],
+                                "show_format": tier.get("format"),
+                                "show_status": tier.get("status"),
+                                "showtime_hash": tier_hash,
+                                "url": seat_api_url,
+                            },
+                            {
+                                "error": {
+                                    "name": type(seat_fetch_ex).__name__,
+                                    "message": str(seat_fetch_ex),
+                                },
+                                "traceback": traceback.format_exc(),
+                            },
+                        )
 
             # --- PHASE 2: PRE-PASS DEAD ROOM DETECTION ---
             aud_booked_sets = {} 
