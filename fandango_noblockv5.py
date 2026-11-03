@@ -787,6 +787,7 @@ class LiveTerminalDashboard:
 
         self.processed_theaters = 0
         self.processed_shows = 0
+        self.total_shows_to_scrape = 0
         self.sold_out_shows = 0
         self.total_capacity = 0
         self.total_booked = 0
@@ -822,8 +823,15 @@ class LiveTerminalDashboard:
                 if self.total_capacity
                 else 0.0
             )
+            progress_percent = (
+                min(self.processed_shows / self.total_shows_to_scrape * 100.0, 100.0)
+                if self.total_shows_to_scrape
+                else 100.0
+            )
             line = (
-                f"Phase 2 progress: {self.processed_theaters}/{self.active_theaters_found} "
+                f"Phase 2 progress: {self.processed_shows:,}/"
+                f"{self.total_shows_to_scrape:,} shows ({progress_percent:.1f}%) | "
+                f"Theaters: {self.processed_theaters}/{self.active_theaters_found} "
                 f"theaters | {self.processed_shows:,} shows "
                 f"(sold out: {self.sold_out_shows}) | Booked: "
                 f"{self.total_booked:,}/{self.total_capacity:,} ({occupancy:.2f}%) "
@@ -877,6 +885,7 @@ class LiveTerminalDashboard:
 
     def start_phase2(self, total_shows_to_scrape: int, total_active_theaters: int):
         self.current_phase = 2
+        self.total_shows_to_scrape = total_shows_to_scrape
         self.active_theaters_found = total_active_theaters
         self.phase_started_at = time.monotonic()
         self.last_progress_log = 0.0
