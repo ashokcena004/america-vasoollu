@@ -45,9 +45,13 @@ OVERRIDE_FIREBASE_DAILY_SNAPSHOT = False  # ⚠️ Set to True to update the Fir
 IGNORE_SOLDOUT_CHAINS = ["AMC"]
 
 # 🚀 HIGH-SPEED ENGINE TUNING PARAMETERS (SAFE AKAMAI PROFILE)
-MAX_WORKERS = 8                     # 8 independent Chromium processes (safe single-IP footprint)
+MAX_WORKERS = 4                     # Limit aggregate request concurrency from a single runner IP
 THEATER_BATCH_SIZE = 5              # Theaters processed per IPC call (fetched sequentially inside JS)
-SEATMAP_CONCURRENCY_PER_WORKER = 2  # Max parallel seatMap requests per worker
+SEATMAP_CONCURRENCY_PER_WORKER = 1  # Serialize seatMap requests within each worker
+THEATER_REQUEST_DELAY_MS = 150      # Stagger sequential theater requests within each batch
+SEATMAP_REQUEST_DELAY_MS = 200      # Pace sequential seatMap requests within each worker
+THEATER_BATCH_COOLDOWN_SECONDS = 0.5
+SEATMAP_THEATER_COOLDOWN_SECONDS = 0.25
 PROACTIVE_ROTATE_LIMIT = 300        # Clear cookies & mint fresh Akamai token every 300 requests
 MAX_API_RETRIES = 4                 # Automatic cookie-reset retries on 403/429/timeout
 
@@ -938,12 +942,12 @@ async def fetch_theaters_batch_js(context, page, batch_items, worker_id, detaile
         try:
             results = await asyncio.wait_for(
                 page.evaluate(
-                    """async ({ items, targetIds }) => {
+                    """async ({ items, targetIds, delayMs }) => {
                         const sleep = (ms) => new Promise(r => setTimeout(r, ms));
                         const out = [];
                         for (let i = 0; i < items.length; i++) {
                             const item = items[i];
-                            if (i > 0) await sleep(45);
+                            if (i > 0) await sleep(delayMs);
                             const controller = new AbortController();
                             const timer = setTimeout(() => controller.abort(), 9000);
                             try {
@@ -976,7 +980,11 @@ async def fetch_theaters_batch_js(context, page, batch_items, worker_id, detaile
                         }
                         return out;
                     }""",
-                    {"items": req_payload, "targetIds": target_ids_list},
+                    {
+                        "items": req_payload,
+                        "targetIds": target_ids_list,
+                        "delayMs": THEATER_REQUEST_DELAY_MS,
+                    },
                 ),
                 timeout=max(16.0, len(req_payload) * 4.5),
             )
@@ -1044,8 +1052,8 @@ async def fetch_seatmaps_for_theater_js(
     context, page, hashes_to_fetch, worker_id, detailed_logger
 ):
     """
-    Fetches all seat maps for an active theater using controlled JS concurrency
-    (SEATMAP_CONCURRENCY_PER_WORKER = 2) with a 65ms stagger. If a 403/429 occurs,
+    Fetches seat maps for an active theater using controlled JS concurrency
+    (SEATMAP_CONCURRENCY_PER_WORKER) with a configurable request delay. If a 403/429 occurs,
     stops immediately, clears cookies, mints a fresh Akamai token, and retries.
     """
     if not hashes_to_fetch:
@@ -1068,7 +1076,7 @@ async def fetch_seatmaps_for_theater_js(
         try:
             batch_res = await asyncio.wait_for(
                 page.evaluate(
-                    """async ({ items, concurrency }) => {
+                    """async ({ items, concurrency, delayMs }) => {
                         const sleep = (ms) => new Promise(r => setTimeout(r, ms));
                         const results = {};
                         let cursor = 0;
@@ -1078,7 +1086,7 @@ async def fetch_seatmaps_for_theater_js(
                             while (cursor < items.length && !rateLimited) {
                                 const index = cursor++;
                                 const item = items[index];
-                                if (index >= concurrency) await sleep(65);
+                                if (index >= concurrency) await sleep(delayMs);
                                 const controller = new AbortController();
                                 const timer = setTimeout(() => controller.abort(), 9000);
                                 try {
@@ -1115,7 +1123,11 @@ async def fetch_seatmaps_for_theater_js(
                         await Promise.all(workers);
                         return results;
                     }""",
-                    {"items": req_items, "concurrency": SEATMAP_CONCURRENCY_PER_WORKER},
+                    {
+                        "items": req_items,
+                        "concurrency": SEATMAP_CONCURRENCY_PER_WORKER,
+                        "delayMs": SEATMAP_REQUEST_DELAY_MS,
+                    },
                 ),
                 timeout=max(16.0, len(pending) * 4.2),
             )
@@ -2429,6 +2441,7 @@ async def run_two_phase_pipeline_async(
                     shows_delta=shows_found_in_batch,
                     retries_delta=retries_cnt,
                 )
+                await asyncio.sleep(THEATER_BATCH_COOLDOWN_SECONDS)
 
         await asyncio.gather(*[_phase1_worker(i) for i in range(MAX_WORKERS)])
         dashboard.finish_phase1()
@@ -2539,6 +2552,7 @@ async def run_two_phase_pipeline_async(
                     healed_cnt=t_healed_cnt,
                     retries_cnt=retries_cnt,
                 )
+                await asyncio.sleep(SEATMAP_THEATER_COOLDOWN_SECONDS)
 
             return {
                 "shows_data": local_shows_data,
