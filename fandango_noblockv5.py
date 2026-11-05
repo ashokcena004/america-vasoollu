@@ -46,11 +46,11 @@ IGNORE_SOLDOUT_CHAINS = ["AMC"]
 
 # 🚀 HIGH-SPEED ENGINE TUNING PARAMETERS (SAFE AKAMAI PROFILE)
 MAX_WORKERS = 5                     # Limit aggregate request concurrency from a single runner IP
-THEATER_BATCH_SIZE = 8              # Theaters processed per IPC call (fetched sequentially inside JS)
+THEATER_BATCH_SIZE = 7              # Theaters processed per IPC call (fetched sequentially inside JS)
 SEATMAP_CONCURRENCY_PER_WORKER = 1  # Serialize seatMap requests within each worker
-THEATER_REQUEST_DELAY_MS = 100      # Stagger sequential theater requests within each batch
+THEATER_REQUEST_DELAY_MS = 150      # Stagger sequential theater requests within each batch
 SEATMAP_REQUEST_DELAY_MS = 200      # Pace sequential seatMap requests within each worker
-THEATER_BATCH_COOLDOWN_SECONDS = 0.2
+THEATER_BATCH_COOLDOWN_SECONDS = 0.3
 SEATMAP_THEATER_COOLDOWN_SECONDS = 0.15
 PROACTIVE_ROTATE_LIMIT = 300        # Clear cookies & mint fresh Akamai token every 300 requests
 MAX_API_RETRIES = 4                 # Automatic cookie-reset retries on 403/429/timeout
