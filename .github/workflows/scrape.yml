@@ -53,7 +53,7 @@ jobs:
           OVERWRITE_SNAPSHOT: "false"
           PLAYWRIGHT_BROWSER_TRACKING: "1"
         run: |
-          python fandango_noblockv5.py
+          python fandango_noblockv4.py
 
       - name: Upload report artifacts
         if: always()

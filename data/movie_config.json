@@ -1,6 +1,6 @@
 {
   "jailer-2": {
-    "movie_url": "https://www.fandango.com/jailer-2-247862/movie-overview",
+    "movie_url": ["https://www.fandango.com/jailer-2-247862/movie-overview"],
     "average_price": 22.0,
     "max_price": 22.0,
     "default_language": "Tamil",
@@ -24,7 +24,7 @@
   },
 
   "aadarsha-kutumbam-house-no-47": {
-    "movie_url": "https://www.fandango.com/aadarsha-kutumbam-house-no-47-ak47-247720/movie-overview",
+    "movie_url": ["https://www.fandango.com/aadarsha-kutumbam-house-no-47-ak47-247720/movie-overview"],
     "average_price": 22.0,
     "max_price": 22.0,
     "default_language": "Telugu",
@@ -36,7 +36,7 @@
   },
 
   "scene": {
-    "movie_url": "https://www.fandango.com/scene-2026-248114/movie-overview",
+    "movie_url": ["https://www.fandango.com/scene-2026-248114/movie-overview"],
     "average_price": 20.0,
     "max_price": 20.0,
     "default_language": "Tamil",

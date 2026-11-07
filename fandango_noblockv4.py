@@ -9,6 +9,7 @@ import traceback
 import logging
 import queue
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import sync_playwright
 import random
@@ -97,12 +98,20 @@ def load_movie_config(config_path, global_slug):
             f"in {config_path}."
         )
 
-    for field in ("movie_url", "default_language"):
-        if not isinstance(movie_config.get(field), str) or not movie_config[field].strip():
-            raise ValueError(
-                f"Movie configuration for {global_slug!r} must provide "
-                f"a non-empty {field!r}."
-            )
+    movie_target_fields = ("movie_url", "movie_urls", "movie_ids", "additional_movie_ids")
+    if not any(movie_config.get(field) not in (None, "", []) for field in movie_target_fields):
+        raise ValueError(
+            f"Movie configuration for {global_slug!r} must provide at least one "
+            "movie URL or ID."
+        )
+    if (
+        not isinstance(movie_config.get("default_language"), str)
+        or not movie_config["default_language"].strip()
+    ):
+        raise ValueError(
+            f"Movie configuration for {global_slug!r} must provide "
+            "a non-empty 'default_language'."
+        )
     for field in ("average_price", "max_price"):
         value = movie_config.get(field)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
@@ -141,6 +150,67 @@ def load_movie_config(config_path, global_slug):
         )
 
     return movie_config
+
+
+def parse_movie_targets(raw_movie_url_field):
+    raw_items = []
+    for entry in (
+        raw_movie_url_field
+        if isinstance(raw_movie_url_field, list)
+        else [raw_movie_url_field]
+    ):
+        raw_items.extend(
+            part.strip()
+            for part in str(entry or "").split(",")
+            if part.strip()
+        )
+
+    parsed_entries = []
+    for item in raw_items:
+        url_match = re.search(
+            r"fandango\.com/([a-zA-Z0-9-]+?)-(\d+)(?:/|$|\?)",
+            item,
+            re.IGNORECASE,
+        )
+        if url_match:
+            slug_part, id_part = url_match.group(1), url_match.group(2)
+            full_url = (
+                item
+                if item.startswith("http")
+                else f"https://www.fandango.com/{slug_part}-{id_part}/movie-overview"
+            )
+            parsed_entries.append((full_url, slug_part, id_part))
+            continue
+
+        slug_match = re.search(r"^([a-zA-Z0-9-]+?)-(\d+)$", item)
+        if slug_match:
+            slug_part, id_part = slug_match.group(1), slug_match.group(2)
+            full_url = f"https://www.fandango.com/{slug_part}-{id_part}/movie-overview"
+            parsed_entries.append((full_url, slug_part, id_part))
+            continue
+
+        if item.isdigit():
+            parsed_entries.append(("", "", item))
+
+    if not parsed_entries:
+        raise ValueError(
+            "Could not extract any valid Fandango Movie ID from movie configuration."
+        )
+
+    primary_entry = next(
+        (entry for entry in parsed_entries if entry[1]),
+        parsed_entries[0],
+    )
+    primary_url, primary_slug, primary_id = primary_entry
+    if not primary_slug:
+        primary_slug = f"movie-{primary_id}"
+    if not primary_url:
+        primary_url = (
+            f"https://www.fandango.com/{primary_slug}-{primary_id}/movie-overview"
+        )
+
+    target_movie_ids = list(dict.fromkeys(entry[2] for entry in parsed_entries))
+    return primary_url, primary_slug, primary_id, target_movie_ids
 
 
 FANDANGO_SCRAPE_QUEUE = load_fandango_scrape_queue(FANDANGO_QUEUE_PATH)
@@ -184,7 +254,20 @@ print(
 
 
 MOVIE_CONFIG = load_movie_config(MOVIE_CONFIG_PATH, GLOBAL_MOVIE_SLUG)
-URL = MOVIE_CONFIG["movie_url"]
+RAW_MOVIE_URL_CONFIG = [
+    entry
+    for field in ("movie_url", "movie_urls", "movie_ids", "additional_movie_ids")
+    for entry in (
+        MOVIE_CONFIG[field]
+        if isinstance(MOVIE_CONFIG.get(field), list)
+        else [MOVIE_CONFIG.get(field)]
+    )
+    if MOVIE_CONFIG.get(field) not in (None, "")
+]
+_, MOVIE_SLUG, MOVIE_ID, TARGET_MOVIE_IDS = parse_movie_targets(
+    RAW_MOVIE_URL_CONFIG
+)
+TARGET_MOVIE_IDS_SET = set(TARGET_MOVIE_IDS)
 AVG_PRICE = float(MOVIE_CONFIG["average_price"])
 MAX_TIER_PRICE = float(MOVIE_CONFIG["max_price"])
 DEFAULT_LANGUAGE = MOVIE_CONFIG["default_language"]
@@ -238,14 +321,6 @@ PREFER_PHYSICAL_SCREENS = []
 # This will surgically combine their seat capacities, tickets sold, and financial gross post-scrape.
 MANUAL_MERGE_SHOWS_THEATRES = ["AAILI"]
 
-# Extra Movie Details
-movie_parts = URL.rstrip("/").split("/")
-if len(movie_parts) < 2 or not movie_parts[-2]:
-    raise ValueError(f"Invalid Fandango movie URL in configuration: {URL!r}")
-movie_part = movie_parts[-2]
-MOVIE_ID = re.search(r"-(\d+)$", movie_part).group(1)
-MOVIE_SLUG = re.sub(r"-\d+$", "", movie_part)
-
 def format_movie_title(movie_slug):
     title_words = movie_slug.replace("-", " ").title().split()
     if len(title_words) > 1 and re.fullmatch(r"(?:19|20)\d{2}", title_words[-1]):
@@ -273,7 +348,180 @@ TARGET_STATES = [
 # ── WORKER FUNCTION ──────────────────────────────────────────────────────────
 # =============================================================================
 
-def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cache=None):
+
+class LiveMetricsLogger:
+    def __init__(self, total_theaters):
+        self.total_theaters = total_theaters
+        self.processed_theaters = 0
+        self.total_shows = 0
+        self.total_capacity = 0
+        self.total_booked = 0
+        self.total_gross = 0.0
+        self.last_line_length = 0
+        self.github_actions = os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+        self.progress_log_interval = 10.0
+        self.last_progress_log = 0.0
+        self.last_progress_message = ""
+        self.latest_progress_message = ""
+        self.lock = threading.Lock()
+
+    def update(self, state, theater_name, show_rows):
+        with self.lock:
+            self.processed_theaters += 1
+            self.total_shows += len(show_rows)
+            self.total_capacity += sum(int(row.get("total", 0) or 0) for row in show_rows)
+            self.total_booked += sum(int(row.get("booked", 0) or 0) for row in show_rows)
+            self.total_gross += sum(float(row.get("gross", 0.0) or 0.0) for row in show_rows)
+
+            occupancy = (
+                self.total_booked / self.total_capacity * 100.0
+                if self.total_capacity
+                else 0.0
+            )
+            atp = self.total_gross / self.total_booked if self.total_booked else 0.0
+            theater_gross = sum(
+                float(row.get("gross", 0.0) or 0.0) for row in show_rows
+            )
+            theater_booked = sum(
+                int(row.get("booked", 0) or 0) for row in show_rows
+            )
+            theater_capacity = sum(
+                int(row.get("total", 0) or 0) for row in show_rows
+            )
+            theater_occupancy = (
+                theater_booked / theater_capacity * 100.0
+                if theater_capacity
+                else 0.0
+            )
+            theater_atp = (
+                theater_gross / theater_booked if theater_booked else 0.0
+            )
+            line = (
+                f"Scraping {self.processed_theaters:,}/{self.total_theaters:,} theaters"
+                f" | Shows: {self.total_shows:,}"
+                f" | Gross: ${self.total_gross:,.2f}"
+                f" | Tickets: {self.total_booked:,}/{self.total_capacity:,}"
+                f" | Occupancy: {occupancy:.2f}%"
+                f" | ATP: ${atp:.2f}"
+                f" | Latest: {state} / {theater_name}"
+                f" (${theater_gross:,.2f}, {theater_booked:,}/{theater_capacity:,},"
+                f" {theater_occupancy:.2f}%, ATP ${theater_atp:.2f})"
+            )
+            self.latest_progress_message = line
+            if self.github_actions:
+                now = time.monotonic()
+                if now - self.last_progress_log < self.progress_log_interval:
+                    return
+                self.last_progress_log = now
+                if line != self.last_progress_message:
+                    print(line, flush=True)
+                    self.last_progress_message = line
+                return
+
+            padding = " " * max(0, self.last_line_length - len(line))
+            print(f"\r{line}{padding}", end="", flush=True)
+            self.last_line_length = len(line)
+
+    def finish(self):
+        if self.github_actions:
+            if self.latest_progress_message != self.last_progress_message:
+                print(self.latest_progress_message, flush=True)
+                self.last_progress_message = self.latest_progress_message
+            return
+        if self.last_line_length:
+            print(f"\r{' ' * self.last_line_length}\r", end="", flush=True)
+
+
+def add_movie_to_grouped_shows(
+    grouped_shows, target_movie, target_state, theater_id, theater_name, multi_id_mode
+):
+    movie_id = str(target_movie.get("id", ""))
+    for variant in target_movie.get("variants", []):
+        raw_header = variant.get("filmFormatHeader", "") or "Standard"
+        base_format = raw_header.replace(" Format", "").strip() or "Standard"
+
+        for amenity in variant.get("amenityGroups", []):
+            raw_amenities = [
+                item.get("name", "").strip()
+                for item in amenity.get("amenities", [])
+                if item.get("name")
+            ]
+            raw_amenities_upper = [name.upper() for name in raw_amenities]
+            is_dbox = any(
+                "D-BOX" in name or "DBOX" in name for name in raw_amenities_upper
+            )
+
+            show_format = base_format
+            premium_keywords = ["XD", "IMAX", "LASER AT AMC", "4DX", "RPX", "D-BOX"]
+            for amenity_name, amenity_upper in zip(
+                raw_amenities, raw_amenities_upper
+            ):
+                if (
+                    any(keyword in amenity_upper for keyword in premium_keywords)
+                    and show_format == base_format
+                ):
+                    show_format = amenity_name
+                    break
+
+            show_language = detect_show_language(raw_amenities, DEFAULT_LANGUAGE)
+            report_format_categories = classify_report_formats(
+                " ".join([raw_header, show_format, *raw_amenities]),
+                base_format=base_format,
+            )
+            if is_dbox and report_format_categories == ["Standard"]:
+                report_format_categories = []
+
+            signature_amenities = [
+                name
+                for name in raw_amenities_upper
+                if "D-BOX" not in name
+                and "DBOX" not in name
+                and "RESERVED" not in name
+                and "RECLINERS" not in name
+            ]
+            signature_amenities.sort()
+            room_signature = "|".join(signature_amenities) or "STANDARD"
+
+            for show in amenity.get("showtimes", []):
+                show_hash = show.get("showtimeHashCode")
+                if not show_hash:
+                    continue
+
+                show_time = show.get("screenReaderTime", "Unknown")
+                status = show.get("type", "Unknown")
+                group_key = (
+                    f"{theater_id}_{movie_id}_{show_time}_{room_signature}"
+                    if multi_id_mode
+                    else f"{theater_id}_{show_time}_{room_signature}"
+                )
+                if group_key not in grouped_shows:
+                    grouped_shows[group_key] = {
+                        "state": target_state,
+                        "theater": theater_name,
+                        "t_id": theater_id,
+                        "time": show_time,
+                        "movie_id": movie_id,
+                        "tiers": [],
+                    }
+                grouped_shows[group_key]["tiers"].append(
+                    {
+                        "hash": show_hash,
+                        "status": status,
+                        "format": show_format,
+                        "format_categories": report_format_categories,
+                        "language": show_language,
+                        "is_dbox": is_dbox,
+                    }
+                )
+
+
+def process_theaters_worker(
+    task_queue,
+    thread_id,
+    total_tasks,
+    master_hash_cache=None,
+    metrics_logger=None,
+):
     if master_hash_cache is None: master_hash_cache = {}
     
     # Local data stores to prevent thread racing conditions
@@ -306,7 +554,10 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
             time.sleep(random.uniform(0.2, 0.35))    
             t_name = t.get('theaterName', 'Unknown')
             t_id = t.get('theaterId')
-            if not t_id: continue
+            if not t_id:
+                if metrics_logger:
+                    metrics_logger.update(target_state, t_name, [])
+                continue
             
             print(f"[Thread-{thread_id}] 🔍 [{task_idx}/{total_tasks}] {target_state[:4].upper()} | {t_name[:40]}")
             api_url = f"https://www.fandango.com/napi/theaterMovieShowtimes/{t_id}?chainCode=&startDate={SHOW_DATE}&isdesktop=false"
@@ -323,11 +574,19 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
 
                 if not raw_data: 
                     print(f"[Thread-{thread_id}] ⚠️ FAILED TO FETCH THEATER MASTER LIST (Akamai Block/Timeout) for {t_name}")
+                    if metrics_logger:
+                        metrics_logger.update(target_state, t_name, [])
                     continue
 
                 movies = raw_data.get('viewModel', {}).get('movies', [])
-                target_movie = next((m for m in movies if str(m.get('id', '')) == MOVIE_ID), None)
-                if not target_movie: 
+                target_movies = [
+                    movie
+                    for movie in movies
+                    if str(movie.get("id", "")).strip() in TARGET_MOVIE_IDS_SET
+                ]
+                if not target_movies:
+                    if metrics_logger:
+                        metrics_logger.update(target_state, t_name, [])
                     continue
                     
                 print(f"[Thread-{thread_id}] 🎬 Found shows at: {t_name[:40]}")
@@ -338,68 +597,24 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         'shows': 0, 'total': 0, 'booked': 0, 'gross': 0.0
                     }
                 
-                grouped_shows = {} 
-                for variant in target_movie.get('variants', []):
-                    raw_header = variant.get('filmFormatHeader', '') or 'Standard'
-                    base_format = raw_header.replace(' Format', '').strip()
-                    if not base_format: base_format = 'Standard'
-
-                    for amenity in variant.get('amenityGroups', []):
-                        # 1. Get all amenities as clean uppercase strings
-                        raw_amenities = [am.get('name', '').strip() for am in amenity.get('amenities', []) if am.get('name')]
-                        raw_amenities_upper = [a.upper() for a in raw_amenities]
-                        is_dbox = any("D-BOX" in a or "DBOX" in a for a in raw_amenities_upper)
-                        
-                        # 2. EXTRACT FORMAT SCANNER ONLY FOR REPORTS (Restores precise casing)
-                        show_format = base_format
-                        premium_keywords = ["XD", "IMAX", "LASER AT AMC", "4DX", "RPX", "D-BOX"]
-                        for am_name, am_up in zip(raw_amenities, raw_amenities_upper):
-                            if any(k in am_up for k in premium_keywords) and show_format == base_format:
-                                show_format = am_name
-                                break
-                        
-                        # Recognize supported languages only before "with" or "Language".
-                        show_language = detect_show_language(raw_amenities, DEFAULT_LANGUAGE)
-                        report_format_categories = classify_report_formats(
-                            " ".join([raw_header, show_format, *raw_amenities]),
-                            base_format=base_format,
-                        )
-                        if is_dbox and report_format_categories == ["Standard"]:
-                            report_format_categories = []
-                        
-                        # 4. THE AMENITY SIGNATURE (The Master Grouper)
-                        signature_amenities = [a for a in raw_amenities_upper if "D-BOX" not in a and "DBOX" not in a and "RESERVED" not in a and "RECLINERS" not in a]
-                        signature_amenities.sort()
-                        room_signature = "|".join(signature_amenities) if signature_amenities else "STANDARD"
-                        
-                        for show in amenity.get('showtimes', []):
-                            show_hash = show.get('showtimeHashCode')
-                            if not show_hash: continue
-                                
-                            show_time = show.get('screenReaderTime', 'Unknown')
-                            status = show.get('type', 'Unknown')
-                            
-                            # 5. Group strictly by Time + The Signature
-                            group_key = f"{t_id}_{show_time}_{room_signature}"
-                            
-                            if group_key not in grouped_shows:
-                                grouped_shows[group_key] = {
-                                    'state': target_state, 'theater': t_name,
-                                    't_id': t_id, 'time': show_time, 'tiers': []
-                                }
-                            grouped_shows[group_key]['tiers'].append({
-                                'hash': show_hash, 
-                                'status': status, 
-                                'format': show_format, 
-                                'format_categories': report_format_categories,
-                                'language': show_language,
-                                'is_dbox': is_dbox
-                            })
+                grouped_shows = {}
+                for target_movie in target_movies:
+                    add_movie_to_grouped_shows(
+                        grouped_shows,
+                        target_movie,
+                        target_state,
+                        t_id,
+                        t_name,
+                        multi_id_mode=len(TARGET_MOVIE_IDS_SET) > 1,
+                    )
             
             except Exception as e:
                 print(f"[Thread-{thread_id}] EXCEPTION processing theater {t_name}: {e}")
+                if metrics_logger:
+                    metrics_logger.update(target_state, t_name, [])
                 continue
 
+            theater_show_start = len(local_shows_data)
             # --- PHASE 1: FETCH ALL MAPS FOR THIS THEATER ---
             for group_key, show_info in grouped_shows.items():
                 show_info['valid_tiers'] = []
@@ -465,12 +680,14 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                         time_booked_seats[aud_id]['has_front_row'] = True
                         
                 for aud_id, data in time_booked_seats.items():
-                    if aud_id not in aud_booked_sets:
-                        aud_booked_sets[aud_id] = []
-                    aud_booked_sets[aud_id].append(data)
+                    aud_key = (show_info.get("movie_id"), aud_id)
+                    if aud_key not in aud_booked_sets:
+                        aud_booked_sets[aud_key] = []
+                    aud_booked_sets[aud_key].append(data)
 
             aud_dead_room_blocks = {}
-            for aud_id, shows_list in aud_booked_sets.items():
+            for aud_key, shows_list in aud_booked_sets.items():
+                aud_id = aud_key[1]
                 if len(shows_list) >= 2:
                     first_show_booked = shows_list[0]['booked']
                     first_show_total = shows_list[0]['total_dots']
@@ -489,13 +706,13 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                     rule_2 = is_exact_match and (occupancy < 0.30) and first_show_booked
                     
                     if rule_1 or rule_2:
-                        aud_dead_room_blocks[aud_id] = first_show_booked
+                        aud_dead_room_blocks[aud_key] = first_show_booked
                         matched_rule = "Rule 1 (<50% + FrontRow)" if rule_1 else "Rule 2 (<30% Strict)"
                         print(f"[{t_id} | Aud {aud_id}] 🛑 DEAD ROOM DETECTED ({matched_rule}): {len(shows_list)} unique shows have the exact same {len(first_show_booked)} structural blocks.")
                     else:
-                        aud_dead_room_blocks[aud_id] = set()
+                        aud_dead_room_blocks[aud_key] = set()
                 else:
-                    aud_dead_room_blocks[aud_id] = set()
+                    aud_dead_room_blocks[aud_key] = set()
 
             # --- PHASE 3: PROCESS EACH SHOW ---
             for group_idx, (group_key, show_info) in enumerate(grouped_shows.items(), 1):
@@ -758,7 +975,9 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                             for vt in cluster['tiers']:
                                 vt_seats = vt['data'].get('seats', [])
                                 aud_id = str(vt['data'].get('auditoriumId', 'Unknown'))
-                                dead_room_seats = aud_dead_room_blocks.get(aud_id, set())
+                                dead_room_seats = aud_dead_room_blocks.get(
+                                    (show_info.get("movie_id"), aud_id), set()
+                                )
                                 
                                 area_stats = {}
                                 for a in vt['data'].get('areas', []):
@@ -1049,6 +1268,13 @@ def process_theaters_worker(task_queue, thread_id, total_tasks, master_hash_cach
                 except Exception as e:
                     print(f"[Thread-{thread_id}] EXCEPTION processing cluster at {show_time}: {e}")
 
+            if metrics_logger:
+                metrics_logger.update(
+                    target_state,
+                    t_name,
+                    local_shows_data[theater_show_start:],
+                )
+
         print(f"[Thread-{thread_id}] 🛑 Queue Empty. Closing browser.")
         browser.close()
 
@@ -1193,6 +1419,8 @@ if __name__ == "__main__":
                 
     total_tasks = tasks_queue.qsize()
     print(f"📦 Total Theaters to process: {total_tasks} across {len(TARGET_STATES)} States.")
+    print(f"🎬 Movie IDs to scrape: {', '.join(TARGET_MOVIE_IDS)}")
+    metrics_logger = LiveMetricsLogger(total_tasks)
 
     # 2. MASTER DATA STORES
     master_shows_data = []
@@ -1332,7 +1560,17 @@ if __name__ == "__main__":
     try:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             # ✨ PASS HASH CACHE TO WORKER
-            futures = [executor.submit(process_theaters_worker, tasks_queue, i+1, total_tasks, master_hash_cache) for i in range(MAX_WORKERS)]
+            futures = [
+                executor.submit(
+                    process_theaters_worker,
+                    tasks_queue,
+                    i + 1,
+                    total_tasks,
+                    master_hash_cache,
+                    metrics_logger,
+                )
+                for i in range(MAX_WORKERS)
+            ]
             
             for future in as_completed(futures):
                 try:
@@ -1376,6 +1614,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n🛑 Pipeline interrupted by user. Saving partial progress...")
 
+    metrics_logger.finish()
 
     # =========================================================================
     # ── 3.6 PREVIOUS RUN COMPARISON ONLY (NO RECOVERY) ───────────────────────
@@ -1914,6 +2153,56 @@ if __name__ == "__main__":
                 raise
 
         pipeline_elapsed = time.time() - PIPELINE_START_TIME
+        if master_shows_data:
+            final_theaters_cnt = len(
+                {
+                    row.get("t_id")
+                    for row in master_shows_data
+                    if not row.get("is_extra")
+                }
+            )
+            final_shows_cnt = sum(
+                1 for row in master_shows_data if not row.get("is_extra")
+            )
+            final_soldout_cnt = sum(
+                1 for row in master_shows_data if row.get("status") == "Sold Out"
+            )
+            final_capacity = sum(
+                int(row.get("total", 0) or 0) for row in master_shows_data
+            )
+            final_booked = sum(
+                int(row.get("booked", 0) or 0) for row in master_shows_data
+            )
+            final_gross = sum(
+                float(row.get("gross", 0.0) or 0.0) for row in master_shows_data
+            )
+            final_occupancy = (
+                final_booked / final_capacity * 100.0 if final_capacity else 0.0
+            )
+            final_atp = final_gross / final_booked if final_booked else 0.0
+            elapsed_minutes, elapsed_seconds = divmod(pipeline_elapsed, 60)
+
+            print("\n" + "=" * 80)
+            print(f"🏆 FINAL BOX OFFICE SUMMARY — {MOVIE_TITLE.upper()} ({SHOW_DATE})")
+            print(f"   Movie IDs: {', '.join(TARGET_MOVIE_IDS)}")
+            print("=" * 80)
+            print(f"  • Active Theaters : {final_theaters_cnt:,}")
+            print(
+                f"  • Total Showtimes : {final_shows_cnt:,} "
+                f"(Sold Out: {final_soldout_cnt:,})"
+            )
+            print(
+                f"  • Tickets Sold    : {final_booked:,} / {final_capacity:,} "
+                f"({final_occupancy:.2f}% Occupancy)"
+            )
+            print(f"  • Effective ATP   : ${final_atp:.2f}")
+            print(f"  • Total Gross ($) : ${final_gross:,.2f}")
+            print(
+                f"  • Total Runtime   : {int(elapsed_minutes)}m "
+                f"{elapsed_seconds:.1f}s"
+            )
+            print("=" * 80)
+
         db.reference("fandango_cron_currentindex").set(FANDANGO_QUEUE_NEXT_INDEX)
         print(f"✅ Queue cursor advanced to {FANDANGO_QUEUE_NEXT_INDEX}.")
         mins, secs = divmod(pipeline_elapsed, 60)
