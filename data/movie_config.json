@@ -45,5 +45,17 @@
     "release_date": "2026-11-06",
     "ignore_soldout_chains": ["AMC"],
     "extra": []
+  },
+
+  "om": {
+    "movie_url": ["https://www.fandango.com/om-chapter-1-udhiram-the-blood-wood-248486/movie-overview"],
+    "average_price": 20.0,
+    "max_price": 20.0,
+    "default_language": "Tamil",
+    "poster_url": "https://m.media-amazon.com/images/M/MV5BNjY3ZDQzMzgtMWRhZS00OWYyLTk3ZjYtMzMzM2U2NmQ3MTAyXkEyXkFqcGc@._V1_.jpg",
+    "cover_url": "https://www.vellinakshatram.com/h-upload/2026/11/12/610374-om-movie-new-update-vellinakshatram.jpg",
+    "release_date": "2026-11-20",
+    "ignore_soldout_chains": ["AMC"],
+    "extra": []
   }
 }
