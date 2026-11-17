@@ -1,13 +1,8 @@
 {
   "queue": [
     {
-      "global_slug": "scene",
-      "show_date": "2026-11-14",
-      "force_update_advance": false
-    },
-    {
-      "global_slug": "scene",
-      "show_date": "2026-11-15",
+      "global_slug": "om",
+      "show_date": "2026-11-19",
       "force_update_advance": false
     }
   ]
